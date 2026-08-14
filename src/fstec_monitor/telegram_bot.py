@@ -17,6 +17,15 @@ from .storage import ObjectStore
 
 log = logging.getLogger(__name__)
 MEANINGFUL_KINDS = {"document_added", "html_content_changed", "attachment_added", "attachment_removed", "attachment_content_changed", "attachment_binary_changed"}
+ADMIN_COMMANDS = (
+    ("start", "открыть меню"),
+    ("status", "статистика и квота"),
+    ("changes", "последние изменения"),
+    ("report", "отчёт по ID события"),
+    ("errors", "последние ошибки"),
+    ("scan", "запустить проверку"),
+    ("help", "справка по командам"),
+)
 
 
 def api_url(api_root: str, token: str, method: str) -> str:
@@ -25,6 +34,23 @@ def api_url(api_root: str, token: str, method: str) -> str:
 
 def is_admin(user_id: int | None, admin_id: int) -> bool:
     return user_id is not None and user_id == admin_id
+
+
+def telegram_commands() -> list[dict[str, str]]:
+    return [{"command": command, "description": description} for command, description in ADMIN_COMMANDS]
+
+
+def admin_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "/status"}, {"text": "/changes"}],
+            [{"text": "/scan"}, {"text": "/errors"}],
+            [{"text": "/help"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Выберите действие или введите /report ID",
+    }
 
 
 def _dt(value) -> str:
@@ -55,7 +81,24 @@ class TelegramBot:
 
     async def send(self, chat_id: int, text: str) -> None:
         for start in range(0, len(text), 3900):
-            await self.call("sendMessage", {"chat_id": chat_id, "text": text[start:start + 3900], "disable_web_page_preview": True})
+            payload = {"chat_id": chat_id, "text": text[start:start + 3900], "disable_web_page_preview": True}
+            if chat_id == settings.telegram_admin_id:
+                payload["reply_markup"] = admin_keyboard()
+            await self.call("sendMessage", payload)
+
+    async def configure_menu(self) -> None:
+        await self.call("setMyCommands", {
+            "commands": telegram_commands(),
+            "scope": {"type": "chat", "chat_id": settings.telegram_admin_id},
+            "language_code": "ru",
+        })
+        try:
+            await self.call("setChatMenuButton", {
+                "chat_id": settings.telegram_admin_id,
+                "menu_button": {"type": "commands"},
+            })
+        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+            log.warning("could not set Telegram chat menu button: %s", exc)
 
     async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> None:
         response = await self.client.post(
@@ -172,7 +215,7 @@ class TelegramBot:
         command = parts[0].split("@", 1)[0].lower()
         try:
             if command in {"/start", "/help"}:
-                await self.send(chat_id, "Команды:\n/status — статистика и квота\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — запустить проверку")
+                await self.send(chat_id, "Меню администратора готово.\n\n/status — статистика и квота\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — запустить проверку")
             elif command == "/status":
                 await self.send(chat_id, self.status_text())
             elif command in {"/changes", "/events"}:
@@ -194,6 +237,10 @@ class TelegramBot:
 
     async def run(self) -> None:
         init_db()
+        try:
+            await self.configure_menu()
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+            await self.report_error("не удалось настроить меню Telegram", exc)
         next_scan = time.monotonic() + settings.scan_interval_seconds
         self.start_scan()
         while True:
