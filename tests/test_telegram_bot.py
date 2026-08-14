@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from fstec_monitor.notify import format_event
+from fstec_monitor.notify import format_event, should_notify_event
 from fstec_monitor.telegram_bot import TelegramBot, api_url, is_admin
 
 
@@ -25,3 +25,8 @@ def test_event_message_escapes_diff_for_telegram_html():
     message = format_event(SimpleNamespace(severity="info", summary="x < y", kind="diff", details="a < b"))
     assert "&lt;" in message
     assert "a < b" not in message
+
+
+def test_markup_only_events_are_not_sent():
+    assert not should_notify_event(SimpleNamespace(kind="html_markup_changed"))
+    assert should_notify_event(SimpleNamespace(kind="html_content_changed"))
