@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fstec
+      POSTGRES_USER: fstec
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fstec"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  monitor:
+    build: .
+    restart: "no"
+    env_file: .env
+    environment:
+      FSTEC_DATABASE_URL: postgresql+psycopg://fstec:change-me@db:5432/fstec
+      FSTEC_STORAGE_DIR: /data/objects
+    volumes:
+      - object-data:/data/objects
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  object-data:

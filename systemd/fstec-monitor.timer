@@ -1,0 +1,10 @@
+[Unit]
+Description=Run FSTEC monitor every two hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:15:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
