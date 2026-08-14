@@ -17,7 +17,7 @@ class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
     async def close(self): await self.fetcher.close()
     def event(self,s,doc,kind,severity,summary,details=""):
-        s.add(Event(document_id=doc.id if doc else None,kind=kind,severity=severity,summary=summary,details=details))
+        s.add(Event(document_id=doc.id if doc else None,kind=kind,severity=severity,summary=summary,details=details,notified=kind=="html_markup_changed"))
     async def discover(self) -> set[str]:
         queue=[canonicalize(settings.catalog_url)]; seen=set(); docs=set()
         prefix=canonicalize(settings.catalog_url)
