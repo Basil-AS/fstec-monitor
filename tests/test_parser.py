@@ -1,3 +1,4 @@
+from fstec_monitor.http import conditional_headers
 from fstec_monitor.parser import is_document_url, parse_page
 
 
@@ -12,3 +13,11 @@ def test_document_url_is_deeper_than_category_url():
     prefix = "https://fstec.ru/dokumenty/vse-dokumenty"
     assert not is_document_url(prefix + "/prikazy", prefix)
     assert is_document_url(prefix + "/prikazy/doc-1", prefix)
+
+
+def test_conditional_headers_only_include_available_validators():
+    assert conditional_headers('"abc"', "Wed, 01 Jan 2025 00:00:00 GMT") == {
+        "If-None-Match": '"abc"',
+        "If-Modified-Since": "Wed, 01 Jan 2025 00:00:00 GMT",
+    }
+    assert conditional_headers() == {}
