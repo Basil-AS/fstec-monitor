@@ -17,6 +17,11 @@ from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
 
 
+async def gather_workers(workers):
+    """Wait for every worker before the shared HTTP client can be closed."""
+    return await asyncio.gather(*workers, return_exceptions=True)
+
+
 class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
     async def close(self): await self.fetcher.close()
@@ -135,6 +140,6 @@ async def run_monitor(baseline=False,limit=0):
                 except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
-        await asyncio.gather(*(process(url) for url in urls))
+        await gather_workers(process(url) for url in urls)
     finally: await m.close()
     return len(urls)
