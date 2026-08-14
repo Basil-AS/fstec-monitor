@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+from fstec_monitor.notify import format_event
 from fstec_monitor.telegram_bot import TelegramBot, api_url, is_admin
 
 
@@ -16,3 +19,9 @@ def test_scan_is_not_running_before_first_background_task():
     bot = TelegramBot.__new__(TelegramBot)
     bot.scan_task = None
     assert not bot.scan_is_running()
+
+
+def test_event_message_escapes_diff_for_telegram_html():
+    message = format_event(SimpleNamespace(severity="info", summary="x < y", kind="diff", details="a < b"))
+    assert "&lt;" in message
+    assert "a < b" not in message

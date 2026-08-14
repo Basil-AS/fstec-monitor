@@ -1,4 +1,6 @@
 from __future__ import annotations
+from html import escape
+
 import httpx
 from sqlalchemy import select
 from .config import settings
@@ -7,7 +9,7 @@ from .telegram_bot import api_url
 
 def format_event(e: Event) -> str:
     icon={"critical":"🔴","warning":"🟠","info":"🔵"}.get(e.severity,"⚪")
-    return f"{icon} <b>ФСТЭК: {e.summary}</b>\n\n<code>{e.kind}</code>\n{e.details[:3000]}"
+    return f"{icon} <b>ФСТЭК: {escape(e.summary)}</b>\n\n<code>{escape(e.kind)}</code>\n{escape(e.details[:3000])}"
 
 async def notify_pending(session) -> int:
     if not settings.telegram_bot_token or not settings.telegram_chat_id: return 0
