@@ -1,11 +1,14 @@
 from __future__ import annotations
+
 from html import escape
 
 import httpx
 from sqlalchemy import select
+
 from .config import settings
 from .models import Event
 from .telegram_bot import api_url
+
 
 def format_event(e: Event) -> str:
     icon={"critical":"🔴","warning":"🟠","info":"🔵"}.get(e.severity,"⚪")

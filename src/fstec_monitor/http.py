@@ -1,7 +1,12 @@
 from __future__ import annotations
-import asyncio, random
+
+import asyncio
+import random
+
 import httpx
+
 from .config import settings
+
 
 class Fetcher:
     def __init__(self):

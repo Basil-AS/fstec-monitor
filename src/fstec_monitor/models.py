@@ -1,9 +1,21 @@
 from __future__ import annotations
-from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+
+from datetime import UTC, datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-def utcnow(): return datetime.now(timezone.utc)
+
+def utcnow(): return datetime.now(UTC)
 
 class Base(DeclarativeBase): pass
 

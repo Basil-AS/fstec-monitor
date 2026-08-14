@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urldefrag, urljoin, urlparse
+
 from bs4 import BeautifulSoup
+
 from .normalize import find_content_root, normalize_space
 
 FILE_EXTENSIONS = {".pdf", ".odt", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".7z"}
@@ -46,6 +49,8 @@ def parse_page(html: str, page_url: str, catalog_prefix: str) -> ParsedDocument:
         text = normalize_space(a.get_text(" ", strip=True)) or absolute.rsplit("/",1)[-1]
         if is_attachment(absolute):
             if absolute not in seen_files: files.append(Link(absolute,text)); seen_files.add(absolute)
-        elif absolute.startswith(catalog_prefix.rstrip("/") + "/") and absolute != canonicalize(page_url):
-            if absolute not in seen_docs: docs.append(Link(absolute,text)); seen_docs.add(absolute)
+        elif (absolute.startswith(catalog_prefix.rstrip("/") + "/")
+              and absolute != canonicalize(page_url)
+              and absolute not in seen_docs):
+            docs.append(Link(absolute,text)); seen_docs.add(absolute)
     return ParsedDocument(title, category, docs, files)
