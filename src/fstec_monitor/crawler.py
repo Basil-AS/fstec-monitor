@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio, difflib, json
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 from sqlalchemy import select
 from .config import settings
@@ -9,7 +10,7 @@ from .extract import semantic_text
 from .http import Fetcher
 from .models import Attachment, AttachmentVersion, Document, Event, Snapshot
 from .normalize import normalize_document_html, sha
-from .parser import canonicalize, parse_page
+from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore
 
 class Monitor:
@@ -27,9 +28,10 @@ class Monitor:
             r=await self.fetcher.get(url); r.raise_for_status()
             parsed=parse_page(r.text,str(r.url),prefix)
             for link in parsed.document_links:
-                # category/list pages usually expose many child links; document pages expose attachments or substantial article text
-                if link.url not in seen: queue.append(link.url)
-            if parsed.attachments or (parsed.title and url != prefix and len(r.text)>10000): docs.add(url)
+                if is_document_url(link.url, prefix):
+                    docs.add(link.url)
+                elif link.url not in seen:
+                    queue.append(link.url)
             if len(seen)>10000: raise RuntimeError("crawl safety limit exceeded")
         return docs
     async def process_document(self,url:str,baseline:bool=False):

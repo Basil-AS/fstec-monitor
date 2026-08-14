@@ -2,7 +2,11 @@ from __future__ import annotations
 import hashlib, re
 from bs4 import BeautifulSoup, Tag
 
-NOISE_SELECTORS = ["script", "style", "noscript", "nav", "footer", ".breadcrumbs", ".breadcrumb", ".pagination", ".social", ".share"]
+NOISE_SELECTORS = [
+    "script", "style", "noscript", "nav", "footer", ".breadcrumbs", ".breadcrumb",
+    ".pagination", ".social", ".share", ".dropfiles-content", ".com-content-article__info",
+    ".article-info", ".item-info", ".tags", ".mod-tagspopular", ".eb-inst",
+]
 
 def sha(data: bytes | str) -> str:
     if isinstance(data, str): data = data.encode("utf-8")
@@ -12,7 +16,10 @@ def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
 
 def find_content_root(soup: BeautifulSoup) -> Tag:
-    selectors = ["article", "main article", ".item-page", ".com-content-article", "main", "#content"]
+    selectors = [
+        ".com-content-article__body", ".item-page .com-content-article__body",
+        "article", "main article", ".item-page", ".com-content-article", "main", "#content",
+    ]
     candidates = [soup.select_one(s) for s in selectors]
     candidates = [c for c in candidates if c]
     return max(candidates, key=lambda x: len(x.get_text(" ", strip=True)), default=soup.body or soup)

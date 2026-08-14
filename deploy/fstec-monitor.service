@@ -1,0 +1,24 @@
+[Unit]
+Description=FSTEC document monitor Telegram bot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/srv/code/bots/fstec-monitor/src/fstec_monitor/telegram_bot.py
+
+[Service]
+Type=simple
+User=fstecmonitor
+Group=fstecmonitor
+WorkingDirectory=/srv/code/bots/fstec-monitor
+EnvironmentFile=/etc/fstec-monitor.env
+ExecStart=/srv/code/bots/fstec-monitor/.venv/bin/python -m fstec_monitor.telegram_bot
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/code/bots/fstec-monitor/data /srv/code/bots/fstec-monitor/var /srv/code/bots/fstec-monitor/logs
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

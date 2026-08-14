@@ -5,7 +5,7 @@ from .config import settings
 
 class Fetcher:
     def __init__(self):
-        self.client=httpx.AsyncClient(timeout=settings.timeout_seconds, follow_redirects=True, headers={"User-Agent": settings.user_agent, "Accept-Language":"ru-RU,ru;q=0.9"})
+        self.client=httpx.AsyncClient(timeout=settings.timeout_seconds, follow_redirects=True, verify=settings.tls_verify, headers={"User-Agent": settings.user_agent, "Accept-Language":"ru-RU,ru;q=0.9"})
     async def close(self): await self.client.aclose()
     async def get(self,url:str) -> httpx.Response:
         last=None

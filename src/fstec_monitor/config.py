@@ -13,5 +13,9 @@ class Settings(BaseSettings):
     max_retries: int = 3
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    telegram_admin_id: int = 151599744
+    telegram_api_root: str = "http://127.0.0.1:8081"
+    scan_interval_seconds: int = 7200
+    tls_verify: bool = True
 
 settings = Settings()

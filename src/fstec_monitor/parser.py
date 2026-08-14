@@ -21,6 +21,14 @@ def canonicalize(url: str) -> str:
     path = parsed.path.rstrip("/") or "/"
     return parsed._replace(path=path, query="", fragment="").geturl()
 
+
+def is_document_url(url: str, catalog_prefix: str) -> bool:
+    prefix_path = urlparse(canonicalize(catalog_prefix)).path.strip("/")
+    url_path = urlparse(canonicalize(url)).path.strip("/")
+    if not url_path.startswith(prefix_path + "/"):
+        return False
+    return len(url_path.split("/")) >= len(prefix_path.split("/")) + 2
+
 def is_attachment(url: str) -> bool:
     path = urlparse(url).path.lower()
     return any(path.endswith(ext) for ext in FILE_EXTENSIONS) or "/download/" in path or "?download" in url.lower()
