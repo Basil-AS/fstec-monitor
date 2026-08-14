@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 import asyncio
+
 import typer
 from rich.console import Console
 from sqlalchemy import select
+
 from .crawler import run_monitor
 from .db import SessionLocal, init_db
 from .models import Event

@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
+from fstec_monitor.models import Event
 from fstec_monitor.notify import format_event, should_notify_event
+from fstec_monitor.reports import event_report
 from fstec_monitor.telegram_bot import TelegramBot, api_url, is_admin
 
 
@@ -30,3 +32,18 @@ def test_event_message_escapes_diff_for_telegram_html():
 def test_markup_only_events_are_not_sent():
     assert not should_notify_event(SimpleNamespace(kind="html_markup_changed"))
     assert should_notify_event(SimpleNamespace(kind="html_content_changed"))
+
+
+def test_event_report_contains_old_new_and_diff():
+    event = Event(
+        id=42,
+        kind="html_content_changed",
+        severity="critical",
+        summary="изменена страница",
+        details="--- old\n+++ new\n@@\n-old line\n+new line",
+    )
+    report = event_report(event, "Документ", "https://example.test/doc")
+    assert "Событие #42" in report
+    assert "old line" in report
+    assert "new line" in report
+    assert "https://example.test/doc" in report

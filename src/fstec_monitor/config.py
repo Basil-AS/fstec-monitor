@@ -1,5 +1,7 @@
 from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="FSTEC_", env_file=".env", extra="ignore")
@@ -17,5 +19,7 @@ class Settings(BaseSettings):
     telegram_api_root: str = "http://127.0.0.1:8081"
     scan_interval_seconds: int = 7200
     tls_verify: bool = True
+    storage_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    telegram_max_file_bytes: int = 45 * 1024 * 1024
 
 settings = Settings()

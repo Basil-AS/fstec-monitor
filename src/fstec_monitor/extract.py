@@ -1,14 +1,20 @@
 from __future__ import annotations
-import io, re, zipfile
+
+import io
+import re
+import zipfile
+
 from lxml import etree
-from .normalize import normalize_space, sha
+
+from .normalize import normalize_space
+
 
 def extract_pdf(data: bytes) -> str:
     try:
         import fitz
         doc=fitz.open(stream=data, filetype="pdf")
         return "\n\n".join(page.get_text("text") for page in doc)
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return ""
 
 def extract_odt(data: bytes) -> str:
@@ -21,7 +27,7 @@ def extract_odt(data: bytes) -> str:
             text=normalize_space(" ".join(node.itertext()))
             if text: texts.append(text)
         return "\n".join(texts)
-    except Exception:
+    except (OSError, ValueError, zipfile.BadZipFile, etree.XMLSyntaxError):
         return ""
 
 def semantic_text(data: bytes, content_type: str, url: str) -> str:

@@ -1,9 +1,11 @@
 from __future__ import annotations
-import asyncio, difflib, json
-from datetime import datetime, timezone
-from pathlib import Path
+
+import difflib
+from datetime import UTC, datetime
 from urllib.parse import urlparse
+
 from sqlalchemy import select
+
 from .config import settings
 from .db import SessionLocal
 from .extract import semantic_text
@@ -11,7 +13,8 @@ from .http import Fetcher
 from .models import Attachment, AttachmentVersion, Document, Event, Snapshot
 from .normalize import normalize_document_html, sha
 from .parser import canonicalize, is_document_url, parse_page
-from .storage import ObjectStore
+from .storage import ObjectStore, StorageQuotaExceeded
+
 
 class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
@@ -54,7 +57,7 @@ class Monitor:
                     diff="\n".join(difflib.unified_diff(old.splitlines(),text.splitlines(),fromfile="old",tofile="new",n=3))[:12000]
                     kind="html_content_changed" if previous.semantic_sha256!=text_hash else "html_markup_changed"
                     self.event(s,doc,kind,"critical" if kind=="html_content_changed" else "info",f"изменена страница: {doc.title or url}",diff)
-            doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(timezone.utc); doc.active=True; doc.missing_runs=0
+            doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
             active_urls={a.url for a in parsed.attachments}
             known=s.scalars(select(Attachment).where(Attachment.document_id==doc.id)).all()
             for a in known:
@@ -66,8 +69,13 @@ class Monitor:
                 if not att:
                     att=Attachment(document_id=doc.id,url=link.url,display_name=link.title); s.add(att); s.flush()
                     if not baseline:self.event(s,doc,"attachment_added","warning",f"добавлено вложение: {link.title}",link.url)
-                att.active=True; att.last_seen_at=datetime.now(timezone.utc); att.display_name=link.title
-                await self.process_attachment(s,doc,att,baseline)
+                att.active=True; att.last_seen_at=datetime.now(UTC); att.display_name=link.title
+                try:
+                    await self.process_attachment(s,doc,att,baseline)
+                except StorageQuotaExceeded as exc:
+                    self.event(s, doc, "storage_error", "critical", f"квота хранилища достигнута: {att.display_name}", str(exc))
+                except Exception as exc:  # noqa: BLE001 — one broken attachment must not hide the document
+                    self.event(s, doc, "fetch_error", "warning", f"ошибка вложения: {att.display_name}", repr(exc))
             if is_new and not baseline:self.event(s,doc,"document_added","warning",f"добавлен документ: {doc.title or url}",url)
             s.commit()
     async def process_attachment(self,s,doc,att,baseline):
@@ -97,7 +105,10 @@ async def run_monitor(baseline=False,limit=0):
         if limit: urls=urls[:limit]
         for url in urls:
             try: await m.process_document(url,baseline)
-            except Exception as e:
+            except StorageQuotaExceeded as e:
+                with SessionLocal() as s:
+                    s.add(Event(kind="storage_error", severity="critical", summary=f"квота хранилища достигнута при загрузке {url}", details=str(e))); s.commit()
+            except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
                 with SessionLocal() as s:
                     s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
     finally: await m.close()

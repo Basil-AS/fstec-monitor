@@ -1,5 +1,8 @@
 from __future__ import annotations
-import hashlib, re
+
+import hashlib
+import re
+
 from bs4 import BeautifulSoup, Tag
 
 NOISE_SELECTORS = [

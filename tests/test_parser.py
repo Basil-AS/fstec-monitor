@@ -1,5 +1,6 @@
 from fstec_monitor.parser import is_document_url, parse_page
 
+
 def test_parser_distinguishes_documents_and_files():
     html="""<html><body><main><h1>Каталог</h1><a href='/dokumenty/vse-dokumenty/prikazy/doc-1'>Doc</a><a href='/files/a.pdf'>PDF</a><a href='/files/a.odt'>ODT</a></main></body></html>"""
     p=parse_page(html,"https://fstec.ru/dokumenty/vse-dokumenty","https://fstec.ru/dokumenty/vse-dokumenty")
