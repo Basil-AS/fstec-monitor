@@ -29,6 +29,7 @@ class Document(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     missing_runs: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_attachment_audit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     snapshots: Mapped[list[Snapshot]] = relationship(back_populates="document")
 
 class Snapshot(Base):
@@ -44,6 +45,8 @@ class Snapshot(Base):
     raw_object: Mapped[str] = mapped_column(Text)
     normalized_html_object: Mapped[str] = mapped_column(Text)
     normalized_text_object: Mapped[str] = mapped_column(Text)
+    etag: Mapped[str] = mapped_column(Text, default="")
+    last_modified: Mapped[str] = mapped_column(Text, default="")
     document: Mapped[Document] = relationship(back_populates="snapshots")
 
 class Attachment(Base):
@@ -69,6 +72,8 @@ class AttachmentVersion(Base):
     semantic_sha256: Mapped[str] = mapped_column(String(64), default="")
     object_key: Mapped[str] = mapped_column(Text)
     extracted_text_key: Mapped[str] = mapped_column(Text, default="")
+    etag: Mapped[str] = mapped_column(Text, default="")
+    last_modified: Mapped[str] = mapped_column(Text, default="")
 
 class Event(Base):
     __tablename__ = "events"
