@@ -1,4 +1,4 @@
-from fstec_monitor.telegram_bot import api_url, is_admin
+from fstec_monitor.telegram_bot import TelegramBot, api_url, is_admin
 
 
 def test_api_url_uses_shared_local_bot_api():
@@ -10,3 +10,9 @@ def test_api_url_uses_shared_local_bot_api():
 def test_only_configured_admin_is_authorized():
     assert is_admin(151599744, 151599744)
     assert not is_admin(151599745, 151599744)
+
+
+def test_scan_is_not_running_before_first_background_task():
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_task = None
+    assert not bot.scan_is_running()

@@ -26,6 +26,7 @@ class TelegramBot:
         self.token = settings.telegram_bot_token
         self.offset: int | None = None
         self.scan_lock = asyncio.Lock()
+        self.scan_task: asyncio.Task[int] | None = None
         self.client = httpx.AsyncClient(timeout=40)
 
     async def close(self) -> None:
@@ -55,6 +56,15 @@ class TelegramBot:
                 await __import__("fstec_monitor.notify", fromlist=["notify_pending"]).notify_pending(session)
             return count
 
+    def scan_is_running(self) -> bool:
+        return self.scan_task is not None and not self.scan_task.done()
+
+    def start_scan(self) -> bool:
+        if self.scan_is_running():
+            return False
+        self.scan_task = asyncio.create_task(self.scan())
+        return True
+
     def status_text(self) -> str:
         with SessionLocal() as session:
             documents = session.scalar(select(func.count(Document.id)).where(Document.active.is_(True))) or 0
@@ -82,22 +92,18 @@ class TelegramBot:
                 events = session.scalars(select(Event).order_by(Event.id.desc()).limit(10)).all()
             await self.send(chat_id, "\n".join(f"{e.created_at:%Y-%m-%d %H:%M} {e.kind}: {e.summary}" for e in events) or "Событий нет.")
         elif command == "/scan":
-            await self.send(chat_id, "Проверка запущена. По завершении изменения придут отдельными сообщениями.")
-            try:
-                count = await self.scan()
-                await self.send(chat_id, f"Проверка завершена. Обработано документов: {count}.")
-            except Exception:
-                await self.send(chat_id, "Проверка завершилась ошибкой. Подробности доступны в journalctl.")
+            if self.start_scan():
+                await self.send(chat_id, "Проверка запущена в фоне. По завершении изменения придут отдельными сообщениями.")
+            else:
+                await self.send(chat_id, "Проверка уже выполняется.")
 
     async def run(self) -> None:
         init_db()
-        next_scan = 0.0
+        next_scan = time.monotonic() + settings.scan_interval_seconds
+        self.start_scan()
         while True:
             if time.monotonic() >= next_scan:
-                try:
-                    await self.scan()
-                except Exception:
-                    pass
+                self.start_scan()
                 next_scan = time.monotonic() + settings.scan_interval_seconds
             payload = {"timeout": 25, "allowed_updates": ["message"]}
             if self.offset is not None:
