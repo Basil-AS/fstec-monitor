@@ -1,11 +1,20 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from .config import settings
 from .models import Base
 
-engine = create_engine(settings.database_url, future=True)
+engine = create_engine(settings.database_url, future=True, connect_args={"timeout": 30, "check_same_thread": False} if settings.database_url.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
