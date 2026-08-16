@@ -4,14 +4,16 @@ import asyncio
 import logging
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from sqlalchemy import func, select
 
+from .access import access_request_text, is_allowed
 from .config import settings
 from .db import SessionLocal, init_db
-from .models import Attachment, AttachmentVersion, Document, Event, Snapshot
+from .models import Attachment, AttachmentVersion, Document, Event, Snapshot, UserAccess
 from .reports import event_report, safe_filename
 from .storage import ObjectStore
 
@@ -24,6 +26,8 @@ ADMIN_COMMANDS = (
     ("report", "отчёт по ID события"),
     ("errors", "последние ошибки"),
     ("scan", "запустить проверку"),
+    ("users", "заявки на доступ"),
+    ("ignore", "игнорируемые категории"),
     ("help", "справка по командам"),
 )
 
@@ -45,6 +49,7 @@ def admin_keyboard() -> dict:
         "keyboard": [
             [{"text": "/status"}, {"text": "/changes"}],
             [{"text": "/scan"}, {"text": "/errors"}],
+            [{"text": "/users"}, {"text": "/ignore"}],
             [{"text": "/help"}],
         ],
         "resize_keyboard": True,
@@ -79,11 +84,13 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
         return body.get("result", {})
 
-    async def send(self, chat_id: int, text: str) -> None:
+    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> None:
         for start in range(0, len(text), 3900):
             payload = {"chat_id": chat_id, "text": text[start:start + 3900], "disable_web_page_preview": True}
             if chat_id == settings.telegram_admin_id:
                 payload["reply_markup"] = admin_keyboard()
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
             await self.call("sendMessage", payload)
 
     async def configure_menu(self) -> None:
@@ -171,6 +178,81 @@ class TelegramBot:
             docs = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))).all()}
         return "\n".join(f"#{e.id} {_dt(e.created_at)} {e.kind}: {docs.get(e.document_id).title if docs.get(e.document_id) else e.summary}" for e in events) or "Изменений нет."
 
+    def users_text(self) -> tuple[str, dict | None]:
+        with SessionLocal() as session:
+            users = session.scalars(select(UserAccess).where(UserAccess.status == "pending").order_by(UserAccess.requested_at)).all()
+        if not users:
+            return "Новых заявок на доступ нет.", None
+        lines = [f"Заявки на доступ: {len(users)}"]
+        buttons = []
+        for user in users:
+            identity = f"@{user.username}" if user.username else user.display_name or "без имени"
+            lines.append(f"{identity} — ID {user.user_id}")
+            buttons.append([{"text": f"✅ {identity[:30]}", "callback_data": f"access:approve:{user.user_id}"}, {"text": "❌", "callback_data": f"access:deny:{user.user_id}"}])
+        return "\n".join(lines), {"inline_keyboard": buttons}
+
+    async def request_access(self, user_id: int, chat_id: int, username: str, display_name: str) -> bool:
+        should_notify = False
+        with SessionLocal() as session:
+            user = session.get(UserAccess, user_id)
+            if user and is_allowed(user):
+                return True
+            if not user:
+                user = UserAccess(user_id=user_id, chat_id=chat_id, username=username, display_name=display_name, status="pending")
+                session.add(user)
+                should_notify = True
+            elif user.status != "pending":
+                user.status = "pending"
+                user.chat_id = chat_id
+                user.username = username
+                user.display_name = display_name
+                user.notification_sent = False
+                should_notify = True
+            else:
+                user.chat_id = chat_id
+                user.username = username
+                user.display_name = display_name
+                should_notify = not user.notification_sent
+            session.commit()
+        if should_notify:
+            await self.send(settings.telegram_admin_id, access_request_text(user_id, username, display_name), {
+                "inline_keyboard": [[
+                    {"text": "✅ Разрешить", "callback_data": f"access:approve:{user_id}"},
+                    {"text": "❌ Отклонить", "callback_data": f"access:deny:{user_id}"},
+                ]]
+            })
+            with SessionLocal() as session:
+                user = session.get(UserAccess, user_id)
+                if user:
+                    user.notification_sent = True
+                    session.commit()
+        await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения." if should_notify else "Ваша заявка уже ожидает решения администратора.")
+        return False
+
+    async def handle_callback(self, callback: dict) -> None:
+        callback_id = callback.get("id")
+        sender = callback.get("from") or {}
+        if callback_id:
+            await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
+        if not is_admin(sender.get("id"), settings.telegram_admin_id):
+            return
+        data = (callback.get("data") or "").split(":")
+        if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
+            return
+        user_id = int(data[2])
+        status = "approved" if data[1] == "approve" else "denied"
+        with SessionLocal() as session:
+            user = session.get(UserAccess, user_id)
+            if not user:
+                await self.send(settings.telegram_admin_id, f"Пользователь {user_id} не найден.")
+                return
+            user.status = status
+            user.reviewed_at = datetime.now(UTC)
+            session.commit()
+            target_chat = user.chat_id
+        await self.send(target_chat, "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.")
+        await self.send(settings.telegram_admin_id, f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.")
+
     async def send_report(self, chat_id: int, event_id: int) -> None:
         store = ObjectStore()
         files: list[tuple[str, bytes, str]] = []
@@ -202,18 +284,28 @@ class TelegramBot:
             await self.send(chat_id, "Старую/новую версию не отправил: файл отсутствует или превышает лимит Telegram. История сохранена на сервере.")
 
     async def handle(self, update: dict) -> None:
+        if update.get("callback_query"):
+            try:
+                await self.handle_callback(update["callback_query"])
+            except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+                await self.report_error("ошибка обработки заявки доступа", exc)
+            return
         message = update.get("message") or {}
         sender = message.get("from") or {}
         chat_id = (message.get("chat") or {}).get("id")
         text = (message.get("text") or "").strip()
         if not chat_id or not text:
             return
-        if not is_admin(sender.get("id"), settings.telegram_admin_id):
-            await self.send(chat_id, "Доступ разрешён только администратору.")
+        sender_id = sender.get("id")
+        if (not is_admin(sender_id, settings.telegram_admin_id)
+                and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
             return
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
+            if command in {"/scan", "/users", "/ignore"} and not is_admin(sender_id, settings.telegram_admin_id):
+                await self.send(chat_id, "Эта команда доступна только администратору.")
+                return
             if command in {"/start", "/help"}:
                 await self.send(chat_id, "Меню администратора готово.\n\n/status — статистика и квота\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — запустить проверку")
             elif command == "/status":
@@ -229,6 +321,12 @@ class TelegramBot:
                 with SessionLocal() as session:
                     errors = session.scalars(select(Event).where(Event.kind.in_({"fetch_error", "storage_error"})).order_by(Event.id.desc()).limit(10)).all()
                 await self.send(chat_id, "\n".join(f"#{e.id} {_dt(e.created_at)} {e.summary}: {e.details[:300]}" for e in errors) or "Ошибок нет.")
+            elif command == "/users":
+                text, markup = self.users_text()
+                await self.send(chat_id, text, markup)
+            elif command == "/ignore":
+                categories = sorted(settings.ignored_category_set)
+                await self.send(chat_id, "Игнорируемые категории:\n" + "\n".join(categories) if categories else "Игнорируемых категорий нет.")
             elif command == "/scan":
                 await self.send(chat_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
@@ -247,7 +345,7 @@ class TelegramBot:
             if time.monotonic() >= next_scan:
                 self.start_scan()
                 next_scan = time.monotonic() + settings.scan_interval_seconds
-            payload = {"timeout": 25, "allowed_updates": ["message"]}
+            payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
             if self.offset is not None:
                 payload["offset"] = self.offset
             try:

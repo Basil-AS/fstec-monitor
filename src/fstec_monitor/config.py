@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,5 +24,10 @@ class Settings(BaseSettings):
     telegram_max_file_bytes: int = 45 * 1024 * 1024
     max_concurrency: int = 8
     attachment_audit_interval_seconds: int = 86400
+    ignored_categories: str = ""
+
+    @property
+    def ignored_category_set(self) -> set[str]:
+        return {re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip().casefold() for value in self.ignored_categories.split(",") if value.strip()}
 
 settings = Settings()

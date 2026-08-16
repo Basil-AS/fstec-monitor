@@ -16,6 +16,10 @@ def init_db() -> None:
     with engine.begin() as connection:
         for table, column in (
             ("documents", "last_attachment_audit_at DATETIME"),
+            ("documents", "current_html_sha256 TEXT DEFAULT ''"),
+            ("documents", "current_semantic_sha256 TEXT DEFAULT ''"),
+            ("documents", "current_etag TEXT DEFAULT ''"),
+            ("documents", "current_last_modified TEXT DEFAULT ''"),
             ("snapshots", "etag TEXT DEFAULT ''"),
             ("snapshots", "last_modified TEXT DEFAULT ''"),
             ("attachment_versions", "etag TEXT DEFAULT ''"),

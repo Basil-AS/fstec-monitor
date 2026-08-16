@@ -25,7 +25,7 @@ def test_only_configured_admin_is_authorized():
 
 def test_admin_menu_contains_only_expected_commands():
     commands = telegram_commands()
-    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "scan", "help"]
+    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "scan", "users", "ignore", "help"]
     assert admin_keyboard()["keyboard"][0] == [{"text": "/status"}, {"text": "/changes"}]
     assert admin_keyboard()["is_persistent"] is True
 
@@ -42,8 +42,13 @@ def test_event_message_escapes_diff_for_telegram_html():
     assert "a < b" not in message
 
 
+def test_event_message_contains_document_link():
+    message = format_event(SimpleNamespace(severity="warning", summary="изменение", kind="diff", details="x"), "https://fstec.ru/doc?a=1")
+    assert 'href="https://fstec.ru/doc?a=1"' in message
+
+
 def test_markup_only_events_are_not_sent():
-    assert not should_notify_event(SimpleNamespace(kind="html_markup_changed"))
+    assert should_notify_event(SimpleNamespace(kind="html_markup_changed"))
     assert should_notify_event(SimpleNamespace(kind="html_content_changed"))
 
 
