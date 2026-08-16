@@ -30,6 +30,10 @@ class Document(Base):
     missing_runs: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_attachment_audit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_html_sha256: Mapped[str] = mapped_column(String(64), default="")
+    current_semantic_sha256: Mapped[str] = mapped_column(String(64), default="")
+    current_etag: Mapped[str] = mapped_column(Text, default="")
+    current_last_modified: Mapped[str] = mapped_column(Text, default="")
     snapshots: Mapped[list[Snapshot]] = relationship(back_populates="document")
 
 class Snapshot(Base):
@@ -85,3 +89,15 @@ class Event(Base):
     summary: Mapped[str] = mapped_column(Text)
     details: Mapped[str] = mapped_column(Text, default="")
     notified: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class UserAccess(Base):
+    __tablename__ = "user_access"
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    username: Mapped[str] = mapped_column(Text, default="")
+    display_name: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notification_sent: Mapped[bool] = mapped_column(Boolean, default=False)

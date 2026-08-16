@@ -17,6 +17,14 @@ from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
 
 
+def category_key(value: str) -> str:
+    return " ".join(value.replace("\xa0", " ").split()).casefold()
+
+
+def snapshot_required(previous_semantic: str, current_semantic: str, has_previous: bool) -> bool:
+    return not has_previous or previous_semantic != current_semantic
+
+
 async def gather_workers(workers):
     """Wait for every worker before the shared HTTP client can be closed."""
     return await asyncio.gather(*workers, return_exceptions=True)
@@ -26,7 +34,7 @@ class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
     async def close(self): await self.fetcher.close()
     def event(self,s,doc,kind,severity,summary,details=""):
-        s.add(Event(document_id=doc.id if doc else None,kind=kind,severity=severity,summary=summary,details=details,notified=kind=="html_markup_changed"))
+        s.add(Event(document_id=doc.id if doc else None,kind=kind,severity=severity,summary=summary,details=details,notified=False))
     async def discover(self) -> set[str]:
         queue=[canonicalize(settings.catalog_url)]; seen=set(); docs=set()
         prefix=canonicalize(settings.catalog_url)
@@ -36,6 +44,8 @@ class Monitor:
             seen.add(url)
             r=await self.fetcher.get(url); r.raise_for_status()
             parsed=parse_page(r.text,str(r.url),prefix)
+            if category_key(parsed.category) in settings.ignored_category_set:
+                continue
             for link in parsed.document_links:
                 if is_document_url(link.url, prefix):
                     docs.add(link.url)
@@ -52,7 +62,7 @@ class Monitor:
         if last_audit and last_audit.tzinfo is None:
             last_audit=last_audit.replace(tzinfo=UTC)
         audit_due=(cached_doc is None or last_audit is None or now-last_audit >= timedelta(seconds=settings.attachment_audit_interval_seconds))
-        validators=conditional_headers(cached_snapshot.etag, cached_snapshot.last_modified) if cached_snapshot and not audit_due else {}
+        validators=conditional_headers((cached_doc.current_etag if cached_doc else "") or (cached_snapshot.etag if cached_snapshot else ""), (cached_doc.current_last_modified if cached_doc else "") or (cached_snapshot.last_modified if cached_snapshot else "")) if cached_doc and not audit_due else {}
         r=await self.fetcher.get(url, headers=validators)
         if r.status_code==304 and cached_doc:
             with SessionLocal() as s:
@@ -66,17 +76,25 @@ class Monitor:
             is_new=doc is None
             if is_new: doc=Document(canonical_url=url,title=parsed.title,category=parsed.category); s.add(doc); s.flush()
             previous=s.scalar(select(Snapshot).where(Snapshot.document_id==doc.id).order_by(Snapshot.id.desc()))
-            raw_hash,raw_key=self.store.put(raw,".html")
-            html_hash,html_key=self.store.put(normalized_html.encode(),".normalized.html")
-            text_hash,text_key=self.store.put(text.encode(),".txt")
-            changed=previous is None or previous.raw_sha256!=raw_hash or previous.semantic_sha256!=text_hash
-            if changed:
+            raw_hash=sha(raw); html_hash=sha(normalized_html); text_hash=sha(text)
+            previous_semantic=doc.current_semantic_sha256 or (previous.semantic_sha256 if previous else "")
+            previous_html=doc.current_html_sha256 or (previous.html_sha256 if previous else "")
+            semantic_changed=snapshot_required(previous_semantic,text_hash,previous is None)
+            markup_changed=bool(previous and previous_html and previous_html!=html_hash)
+            if semantic_changed:
+                raw_hash,raw_key=self.store.put(raw,".html")
+                html_hash,html_key=self.store.put(normalized_html.encode(),".normalized.html")
+                text_hash,text_key=self.store.put(text.encode(),".txt")
                 s.add(Snapshot(document_id=doc.id,status_code=r.status_code,final_url=str(r.url),raw_sha256=raw_hash,semantic_sha256=text_hash,html_sha256=html_hash,raw_object=raw_key,normalized_html_object=html_key,normalized_text_object=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
                 if previous and not baseline:
                     old=self.store.read(previous.normalized_text_object).decode(errors="replace")
                     diff="\n".join(difflib.unified_diff(old.splitlines(),text.splitlines(),fromfile="old",tofile="new",n=3))[:12000]
-                    kind="html_content_changed" if previous.semantic_sha256!=text_hash else "html_markup_changed"
-                    self.event(s,doc,kind,"critical" if kind=="html_content_changed" else "info",f"изменена страница: {doc.title or url}",diff)
+                    self.event(s,doc,"html_content_changed","critical",f"изменена страница: {doc.title or url}",diff)
+            elif markup_changed and not baseline:
+                old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
+                diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
+                self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
+            doc.current_html_sha256=html_hash; doc.current_semantic_sha256=text_hash; doc.current_etag=r.headers.get("etag", ""); doc.current_last_modified=r.headers.get("last-modified", "")
             doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
             active_urls={a.url for a in parsed.attachments}
             known=s.scalars(select(Attachment).where(Attachment.document_id==doc.id)).all()
@@ -91,7 +109,7 @@ class Monitor:
                     att=Attachment(document_id=doc.id,url=link.url,display_name=link.title); s.add(att); s.flush()
                     if not baseline:self.event(s,doc,"attachment_added","warning",f"добавлено вложение: {link.title}",link.url)
                 att.active=True; att.last_seen_at=datetime.now(UTC); att.display_name=link.title
-                if audit_attachments:
+                if audit_attachments or not s.scalar(select(AttachmentVersion.id).where(AttachmentVersion.attachment_id==att.id).limit(1)):
                     try:
                         await self.process_attachment(s,doc,att,baseline)
                     except StorageQuotaExceeded as exc:
@@ -128,6 +146,11 @@ def PathSuffix(url,ctype):
 async def run_monitor(baseline=False,limit=0):
     m=Monitor()
     try:
+        with SessionLocal() as s:
+            for doc in s.scalars(select(Document).where(Document.active.is_(True))).all():
+                if category_key(doc.category) in settings.ignored_category_set:
+                    doc.active=False
+            s.commit()
         urls=sorted(await m.discover())
         if limit: urls=urls[:limit]
         semaphore=asyncio.Semaphore(settings.max_concurrency)
