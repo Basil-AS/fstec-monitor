@@ -26,8 +26,12 @@ async def notify_pending(session) -> int:
         for e in events:
             if not should_notify_event(e):
                 e.notified = True
+                session.commit()
                 continue
-            document = session.get(Document, e.document_id) if e.document_id else None
+            with session.no_autoflush:
+                document = session.get(Document, e.document_id) if e.document_id else None
             r=await client.post(api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"), json={"chat_id":settings.telegram_chat_id,"text":format_event(e, document.canonical_url if document else ""),"parse_mode":"HTML","disable_web_page_preview":True})
-            r.raise_for_status(); e.notified=True
-    session.commit(); return len(events)
+            r.raise_for_status()
+            e.notified=True
+            session.commit()
+    return len(events)
