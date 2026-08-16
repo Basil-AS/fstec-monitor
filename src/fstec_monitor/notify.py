@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from html import escape
 
 import httpx
@@ -8,6 +10,8 @@ from sqlalchemy import select
 from .config import settings
 from .models import Document, Event
 from .telegram_bot import api_url
+
+log = logging.getLogger(__name__)
 
 
 def format_event(e: Event, document_url: str = "") -> str:
@@ -22,16 +26,27 @@ def should_notify_event(e: Event) -> bool:
 async def notify_pending(session) -> int:
     if not settings.telegram_bot_token or not settings.telegram_chat_id: return 0
     events=session.scalars(select(Event).where(Event.notified.is_(False)).order_by(Event.id)).all()
-    async with httpx.AsyncClient(timeout=30) as client:
+    sent = 0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
         for e in events:
             if not should_notify_event(e):
                 e.notified = True
                 session.commit()
+                sent += 1
                 continue
             with session.no_autoflush:
                 document = session.get(Document, e.document_id) if e.document_id else None
-            r=await client.post(api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"), json={"chat_id":settings.telegram_chat_id,"text":format_event(e, document.canonical_url if document else ""),"parse_mode":"HTML","disable_web_page_preview":True})
-            r.raise_for_status()
+            try:
+                r=await client.post(api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"), json={"chat_id":settings.telegram_chat_id,"text":format_event(e, document.canonical_url if document else ""),"parse_mode":"HTML","disable_web_page_preview":True})
+                r.raise_for_status()
+                body = r.json()
+                if not body.get("ok"):
+                    raise RuntimeError(body.get("description", "Telegram API rejected notification"))
+            except (httpx.HTTPError, RuntimeError) as exc:
+                log.warning("notification %s failed: %s", e.id, exc)
+                continue
             e.notified=True
             session.commit()
-    return len(events)
+            sent += 1
+            await asyncio.sleep(0.1)
+    return sent
