@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -13,8 +13,17 @@ from sqlalchemy import func, select
 from .access import access_request_text, is_allowed
 from .config import settings
 from .db import SessionLocal, init_db
-from .models import Attachment, AttachmentVersion, Document, Event, Snapshot, UserAccess
+from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, Snapshot, UserAccess
 from .reports import event_report, safe_filename
+from .schedule import (
+    DAILY_MIDNIGHT,
+    DAILY_NOON,
+    DISABLED,
+    EVERY_TWO_HOURS,
+    SCHEDULE_MODES,
+    next_scheduled_at,
+    schedule_label,
+)
 from .storage import ObjectStore
 
 log = logging.getLogger(__name__)
@@ -28,6 +37,7 @@ ADMIN_COMMANDS = (
     ("scan", "запустить проверку"),
     ("users", "заявки на доступ"),
     ("ignore", "игнорируемые категории"),
+    ("settings", "настройки расписания"),
     ("help", "справка по командам"),
 )
 
@@ -50,11 +60,24 @@ def admin_keyboard() -> dict:
             [{"text": "/status"}, {"text": "/changes"}],
             [{"text": "/scan"}, {"text": "/errors"}],
             [{"text": "/users"}, {"text": "/ignore"}],
+            [{"text": "🔍 Проверить сейчас"}, {"text": "⚙️ Настройки"}],
             [{"text": "/help"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
         "input_field_placeholder": "Выберите действие или введите /report ID",
+    }
+
+
+def settings_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Раз в сутки · 12:00", "callback_data": f"settings:set:{DAILY_NOON}"}],
+            [{"text": "Раз в сутки · 00:00", "callback_data": f"settings:set:{DAILY_MIDNIGHT}"}],
+            [{"text": "Каждые 2 часа", "callback_data": f"settings:set:{EVERY_TWO_HOURS}"}],
+            [{"text": "⏸ Выключить автозапуск", "callback_data": f"settings:set:{DISABLED}"}],
+            [{"text": "↩️ Главное меню", "callback_data": "menu:main"}],
+        ]
     }
 
 
@@ -70,6 +93,8 @@ class TelegramBot:
         self.offset: int | None = None
         self.scan_lock = asyncio.Lock()
         self.scan_task: asyncio.Task[int] | None = None
+        self.next_scan_at: datetime | None = None
+        self.schedule_mode: str | None = None
         self.client = httpx.AsyncClient(timeout=40)
         self.last_error_notice = 0.0
 
@@ -140,6 +165,37 @@ class TelegramBot:
     def scan_is_running(self) -> bool:
         return self.scan_task is not None and not self.scan_task.done()
 
+    def get_schedule_mode(self) -> str:
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, "scan_schedule")
+            mode = setting.value if setting else DAILY_NOON
+        return mode if mode in SCHEDULE_MODES else DAILY_NOON
+
+    def set_schedule_mode(self, mode: str) -> None:
+        if mode not in SCHEDULE_MODES:
+            raise ValueError(f"Unknown schedule mode: {mode}")
+        init_db()
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, "scan_schedule")
+            if setting is None:
+                setting = BotSetting(key="scan_schedule", value=mode)
+                session.add(setting)
+            else:
+                setting.value = mode
+            session.commit()
+        self.next_scan_at = next_scheduled_at(mode, datetime.now().astimezone())
+
+    def settings_text(self) -> str:
+        mode = self.get_schedule_mode()
+        next_run = next_scheduled_at(mode, datetime.now().astimezone())
+        next_text = _dt(next_run) if next_run else "выключен"
+        state = "идёт сейчас" if self.scan_is_running() else "не выполняется"
+        return ("⚙️ Настройки проверки\n"
+                f"Расписание: {schedule_label(mode)}\n"
+                f"Следующая проверка: {next_text}\n"
+                f"Текущее состояние: {state}\n\n"
+                "Выберите новый режим:")
+
     def start_scan(self) -> bool:
         if self.scan_is_running():
             return False
@@ -166,11 +222,16 @@ class TelegramBot:
             last_change = session.scalar(select(func.max(Event.created_at)).where(Event.kind.in_(MEANINGFUL_KINDS)))
             errors = session.scalar(select(func.count(Event.id)).where(Event.kind.in_({"fetch_error", "storage_error"}))) or 0
         used, quota = ObjectStore().quota_status()
+        mode = self.get_schedule_mode()
+        next_run = next_scheduled_at(mode, datetime.now().astimezone())
         return ("ФСТЭК Monitor\n"
                 f"Документы: {documents}\nВложения: {attachments}\n"
                 f"Последняя проверка: {_dt(last_scan)}\nПоследнее изменение: {_dt(last_change)}\n"
                 f"Статус изменений: {'есть новые' if pending else 'изменений нет'}\n"
-                f"Хранилище: {used / 1024**3:.2f} / {quota / 1024**3:.2f} ГБ\nОшибок в журнале: {errors}")
+                f"Хранилище: {used / 1024**3:.2f} / {quota / 1024**3:.2f} ГБ\nОшибок в журнале: {errors}\n"
+                f"Расписание: {schedule_label(mode)}\n"
+                f"Следующая проверка: {_dt(next_run) if next_run else 'выключен'}\n"
+                f"Состояние: {'проверка выполняется' if self.scan_is_running() else 'ожидание'}")
 
     def changes_text(self, limit: int = 10) -> str:
         with SessionLocal() as session:
@@ -237,6 +298,17 @@ class TelegramBot:
         if not is_admin(sender.get("id"), settings.telegram_admin_id):
             return
         data = (callback.get("data") or "").split(":")
+        if data == ["menu", "main"]:
+            await self.send(settings.telegram_admin_id, "Главное меню готово. Выберите действие:")
+            return
+        if len(data) == 3 and data[0] == "settings" and data[1] == "set":
+            try:
+                self.set_schedule_mode(data[2])
+            except ValueError:
+                await self.send(settings.telegram_admin_id, "Неизвестный режим расписания.")
+                return
+            await self.send(settings.telegram_admin_id, f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard())
+            return
         if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
             return
         user_id = int(data[2])
@@ -301,13 +373,16 @@ class TelegramBot:
                 and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
             return
         parts = text.split()
+        text_commands = {"🔍 Проверить сейчас": "/scan", "⚙️ Настройки": "/settings"}
+        text = text_commands.get(text, text)
+        parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
-            if command in {"/scan", "/users", "/ignore"} and not is_admin(sender_id, settings.telegram_admin_id):
+            if command in {"/scan", "/users", "/ignore", "/settings"} and not is_admin(sender_id, settings.telegram_admin_id):
                 await self.send(chat_id, "Эта команда доступна только администратору.")
                 return
             if command in {"/start", "/help"}:
-                await self.send(chat_id, "Меню администратора готово.\n\n/status — статистика и квота\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — запустить проверку")
+                await self.send(chat_id, "Меню готово.\n\n/status — статистика, квота и расписание\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — проверить сейчас\n/settings — настроить расписание")
             elif command == "/status":
                 await self.send(chat_id, self.status_text())
             elif command in {"/changes", "/events"}:
@@ -329,6 +404,8 @@ class TelegramBot:
                 await self.send(chat_id, "Игнорируемые категории:\n" + "\n".join(categories) if categories else "Игнорируемых категорий нет.")
             elif command == "/scan":
                 await self.send(chat_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
+            elif command == "/settings":
+                await self.send(chat_id, self.settings_text(), settings_keyboard())
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
             await self.send(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.")
@@ -339,12 +416,17 @@ class TelegramBot:
             await self.configure_menu()
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error("не удалось настроить меню Telegram", exc)
-        next_scan = time.monotonic() + settings.scan_interval_seconds
-        self.start_scan()
+        self.schedule_mode = self.get_schedule_mode()
+        self.next_scan_at = next_scheduled_at(self.schedule_mode, datetime.now().astimezone())
         while True:
-            if time.monotonic() >= next_scan:
+            current_mode = self.get_schedule_mode()
+            if current_mode != self.schedule_mode:
+                self.schedule_mode = current_mode
+                self.next_scan_at = next_scheduled_at(current_mode, datetime.now().astimezone())
+            now = datetime.now().astimezone()
+            if self.next_scan_at is not None and now >= self.next_scan_at:
                 self.start_scan()
-                next_scan = time.monotonic() + settings.scan_interval_seconds
+                self.next_scan_at = next_scheduled_at(current_mode, now + timedelta(seconds=1))
             payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
             if self.offset is not None:
                 payload["offset"] = self.offset

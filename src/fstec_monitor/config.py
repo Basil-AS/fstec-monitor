@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
     telegram_admin_id: int = 151599744
     telegram_api_root: str = "http://127.0.0.1:8081"
-    scan_interval_seconds: int = 7200
+    scan_interval_seconds: int = 86400
     tls_verify: bool = True
     storage_quota_bytes: int = 5 * 1024 * 1024 * 1024
     telegram_max_file_bytes: int = 45 * 1024 * 1024
