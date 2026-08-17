@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from typing import ClassVar
 
+import pytest
+
 import fstec_monitor.telegram_bot as telegram_bot_module
 from fstec_monitor.models import Event
 from fstec_monitor.notify import format_event, should_notify_event
@@ -115,6 +117,36 @@ def test_settings_callback_changes_mode_and_confirms(monkeypatch):
 
     assert bot.selected_mode == "disabled"
     assert any("Расписание изменено" in args[1] for args in sent)
+
+
+def test_run_does_not_start_scan_immediately(monkeypatch):
+    class StopRun(Exception):
+        pass
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.offset = None
+    started = []
+    bot.configure_menu = lambda: None
+    bot.get_schedule_mode = lambda: "daily_noon"
+    bot.start_scan = lambda: started.append(True)
+
+    async def configure_menu():
+        return None
+
+    async def call(method, _payload):
+        if method == "getUpdates":
+            raise StopRun
+        return {}
+
+    bot.configure_menu = configure_menu
+    bot.call = call
+    monkeypatch.setattr(telegram_bot_module, "init_db", lambda: None)
+
+    with pytest.raises(StopRun):
+        import asyncio
+        asyncio.run(bot.run())
+
+    assert started == []
 
 
 def test_scan_is_not_running_before_first_background_task():
