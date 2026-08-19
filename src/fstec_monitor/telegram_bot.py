@@ -425,6 +425,12 @@ class TelegramBot:
             deleted = await asyncio.to_thread(self.clear_errors)
             await self.send(settings.telegram_admin_id, f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
             return
+        if data == ["scan", "run", "cancel"]:
+            await self.send(settings.telegram_admin_id, "Запуск проверки отменён.")
+            return
+        if data == ["scan", "run", "confirm"]:
+            await self.send(settings.telegram_admin_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
+            return
         if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
             result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
             await self.send(settings.telegram_admin_id, result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
@@ -534,7 +540,15 @@ class TelegramBot:
                 text_out, markup = await asyncio.to_thread(self.ignore_text)
                 await self.send(chat_id, text_out, markup)
             elif command == "/scan":
-                await self.send(chat_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
+                if self.scan_is_running():
+                    await self.send(chat_id, "Проверка уже выполняется.")
+                else:
+                    await self.send(chat_id, "Запустить полную проверку каталога ФСТЭК сейчас?", {
+                        "inline_keyboard": [[
+                            {"text": "▶️ Запустить", "callback_data": "scan:run:confirm"},
+                            {"text": "Отмена", "callback_data": "scan:run:cancel"},
+                        ]]
+                    })
             elif command == "/settings":
                 await self.send(chat_id, await asyncio.to_thread(self.settings_text), settings_keyboard())
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:

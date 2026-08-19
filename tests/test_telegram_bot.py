@@ -293,3 +293,36 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     assert "```diff" in md
     assert "-old line" in md and "+new line" in md
     assert "old-Doc.txt" in by_name and "new-Doc.txt" in by_name
+
+
+def test_scan_requires_confirmation_and_callback_starts_it():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_task = None
+    started = []
+    bot.start_scan = lambda: started.append(True) or True
+    sent = []
+
+    async def send(_chat_id, text, markup=None):
+        sent.append((text, markup))
+
+    async def call(*_args, **_kwargs):
+        return {}
+
+    bot.send = send
+    bot.call = call
+
+    admin_update = {"message": {"from": {"id": 151599744}, "chat": {"id": 151599744}, "text": "/scan"}}
+    asyncio.run(bot.handle(admin_update))
+    assert started == []
+    assert "Запустить полную проверку" in sent[-1][0]
+    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "scan:run:confirm"
+
+    asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "data": "scan:run:cancel"}))
+    assert started == []
+    assert "отмен" in sent[-1][0].lower()
+
+    asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:run:confirm"}))
+    assert started == [True]
+    assert "запущена" in sent[-1][0].lower()
