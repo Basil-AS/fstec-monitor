@@ -400,7 +400,10 @@ class TelegramBot:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
         if callback_id:
-            await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
+            try:
+                await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
+            except (OSError, RuntimeError, httpx.HTTPError) as exc:
+                log.warning("answerCallbackQuery failed (expired query?): %s", exc)
         if not is_admin(sender.get("id"), settings.telegram_admin_id):
             return
         data = (callback.get("data") or "").split(":")
@@ -579,4 +582,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # httpx INFO logs full request URLs, which would leak the bot token into journald.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(main())
