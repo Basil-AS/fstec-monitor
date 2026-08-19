@@ -2,15 +2,19 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 import fstec_monitor.telegram_bot as telegram_bot_module
-from fstec_monitor.models import Event
+from fstec_monitor.models import Base, Document, Event, Snapshot
 from fstec_monitor.notify import format_event, should_notify_event
-from fstec_monitor.reports import event_report
+from fstec_monitor.reports import event_report, event_report_md
+from fstec_monitor.storage import ObjectStore
 from fstec_monitor.telegram_bot import (
     TelegramBot,
     admin_keyboard,
     api_url,
+    category_token,
     is_admin,
     settings_keyboard,
     telegram_commands,
@@ -30,7 +34,7 @@ def test_only_configured_admin_is_authorized():
 
 def test_admin_menu_contains_only_expected_commands():
     commands = telegram_commands()
-    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "scan", "users", "ignore", "settings", "help"]
+    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "diff", "errors", "clear_errors", "scan", "users", "ignore", "settings", "help"]
     assert admin_keyboard()["keyboard"][0] == [{"text": "/status"}, {"text": "/changes"}]
     assert admin_keyboard()["is_persistent"] is True
 
@@ -167,7 +171,7 @@ def test_event_message_contains_document_link():
 
 
 def test_markup_only_events_are_not_sent():
-    assert should_notify_event(SimpleNamespace(kind="html_markup_changed"))
+    assert not should_notify_event(SimpleNamespace(kind="html_markup_changed"))
     assert should_notify_event(SimpleNamespace(kind="html_content_changed"))
 
 
@@ -184,3 +188,108 @@ def test_event_report_contains_old_new_and_diff():
     assert "old line" in report
     assert "new line" in report
     assert "https://example.test/doc" in report
+
+
+@pytest.fixture
+def tmp_db(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/bot-test.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(telegram_bot_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(telegram_bot_module, "init_db", lambda: None)
+    return session_factory
+
+
+def test_event_report_md_wraps_diff_in_fence():
+    event = Event(
+        id=7,
+        kind="html_content_changed",
+        severity="critical",
+        summary="изменена страница",
+        details="--- old\n+++ new\n@@\n-old\n+new",
+    )
+    md = event_report_md(event, "Документ", "https://example.test/doc")
+    assert "# Отчёт об изменении · событие #7" in md
+    assert "```diff" in md
+    assert "-old" in md and "+new" in md
+
+
+def test_clear_errors_removes_only_error_events(tmp_db):
+    with tmp_db() as session:
+        session.add(Event(kind="fetch_error", severity="warning", summary="e1"))
+        session.add(Event(kind="storage_error", severity="critical", summary="e2"))
+        session.add(Event(kind="document_added", severity="warning", summary="keep"))
+        session.commit()
+    bot = TelegramBot.__new__(TelegramBot)
+
+    text, markup = bot.clear_errors_text()
+    assert "2 событий" in text
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "errors:clear:confirm"
+
+    assert bot.clear_errors() == 2
+    with tmp_db() as session:
+        remaining = [e.kind for e in session.scalars(select(Event)).all()]
+    assert remaining == ["document_added"]
+    assert bot.clear_errors_text()[1] is None
+
+
+def test_ignore_toggle_persists_category(tmp_db):
+    with tmp_db() as session:
+        session.add(Document(canonical_url="https://example.test/1", category="Приказы"))
+        session.commit()
+    bot = TelegramBot.__new__(TelegramBot)
+
+    token = category_token("Приказы")
+    assert "добавлена в игнор" in bot.toggle_ignored_category(token)
+    assert bot.ignored_categories_db() == ["Приказы"]
+    text, markup = bot.ignore_text()
+    assert "Приказы" in text
+    assert any(f"ignore:t:{token}" == b["callback_data"] for row in markup["inline_keyboard"] for b in row)
+    assert "снова отслеживается" in bot.toggle_ignored_category(token)
+    assert bot.ignored_categories_db() == []
+    assert bot.toggle_ignored_category("0" * 16) is None
+
+
+def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):
+    store = ObjectStore(root=tmp_path / "objects", quota_root=tmp_path, quota_bytes=10**9)
+    _, old_key = store.put(b"old line\n", ".txt")
+    _, new_key = store.put(b"new line\n", ".txt")
+    with tmp_db() as session:
+        doc = Document(canonical_url="https://example.test/doc", title="Doc")
+        session.add(doc)
+        session.flush()
+        for key in (old_key, new_key):
+            session.add(Snapshot(
+                document_id=doc.id, status_code=200, final_url=doc.canonical_url,
+                raw_sha256="a" * 64, semantic_sha256="b" * 64, html_sha256="c" * 64,
+                raw_object=key, normalized_html_object=key, normalized_text_object=key,
+            ))
+        event = Event(
+            document_id=doc.id, kind="html_content_changed", severity="critical",
+            summary="изменена страница", details="--- old\n+++ new\n-old line\n+new line",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+    monkeypatch.setattr(telegram_bot_module, "ObjectStore", lambda: store)
+    bot = TelegramBot.__new__(TelegramBot)
+    files = []
+
+    async def send_file(_chat_id, name, data, caption=""):
+        files.append((name, data))
+
+    async def send(*_args, **_kwargs):
+        return None
+
+    bot.send_file = send_file
+    bot.send = send
+
+    import asyncio
+    asyncio.run(bot.send_report(123, event_id))
+
+    by_name = dict(files)
+    assert f"diff_{event_id}.md" in by_name
+    md = by_name[f"diff_{event_id}.md"].decode()
+    assert "```diff" in md
+    assert "-old line" in md and "+new line" in md
+    assert "old-Doc.txt" in by_name and "new-Doc.txt" in by_name

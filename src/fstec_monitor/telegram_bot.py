@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -8,13 +9,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from .access import access_request_text, is_allowed
 from .config import settings
 from .db import SessionLocal, init_db
 from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, Snapshot, UserAccess
-from .reports import event_report, safe_filename
+from .normalize import normalize_space
+from .reports import event_report_md, safe_filename
 from .schedule import (
     DAILY_MIDNIGHT,
     DAILY_NOON,
@@ -28,12 +30,17 @@ from .storage import ObjectStore
 
 log = logging.getLogger(__name__)
 MEANINGFUL_KINDS = {"document_added", "html_content_changed", "attachment_added", "attachment_removed", "attachment_content_changed", "attachment_binary_changed"}
+ERROR_KINDS = ("fetch_error", "storage_error")
+IGNORED_SETTING_KEY = "ignored_categories"
+QUOTA_CACHE_SECONDS = 300
 ADMIN_COMMANDS = (
     ("start", "открыть меню"),
     ("status", "статистика и квота"),
     ("changes", "последние изменения"),
     ("report", "отчёт по ID события"),
+    ("diff", "diff изменения как Markdown-файл"),
     ("errors", "последние ошибки"),
+    ("clear_errors", "очистить журнал ошибок"),
     ("scan", "запустить проверку"),
     ("users", "заявки на доступ"),
     ("ignore", "игнорируемые категории"),
@@ -85,6 +92,14 @@ def _dt(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M") if value else "нет данных"
 
 
+def category_key(value: str) -> str:
+    return normalize_space(value).casefold()
+
+
+def category_token(value: str) -> str:
+    return hashlib.sha1(category_key(value).encode()).hexdigest()[:16]
+
+
 class TelegramBot:
     def __init__(self) -> None:
         if not settings.telegram_bot_token:
@@ -97,6 +112,7 @@ class TelegramBot:
         self.schedule_mode: str | None = None
         self.client = httpx.AsyncClient(timeout=40)
         self.last_error_notice = 0.0
+        self._quota_cache: tuple[float, tuple[int, int]] | None = None
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -136,7 +152,7 @@ class TelegramBot:
         response = await self.client.post(
             api_url(settings.telegram_api_root, self.token, "sendDocument"),
             data={"chat_id": str(chat_id), "caption": caption[:900]},
-            files={"document": (name, data, "application/octet-stream")},
+            files={"document": (name, data, "text/markdown" if name.endswith(".md") else "application/octet-stream")},
         )
         response.raise_for_status()
         body = response.json()
@@ -213,25 +229,38 @@ class TelegramBot:
         except Exception:
             log.exception("could not notify admin about error")
 
-    def status_text(self) -> str:
-        with SessionLocal() as session:
-            documents = session.scalar(select(func.count(Document.id)).where(Document.active.is_(True))) or 0
-            attachments = session.scalar(select(func.count(Attachment.id)).where(Attachment.active.is_(True))) or 0
-            pending = session.scalar(select(func.count(Event.id)).where(Event.notified.is_(False), Event.kind.in_(MEANINGFUL_KINDS))) or 0
-            last_scan = session.scalar(select(func.max(Snapshot.fetched_at)))
-            last_change = session.scalar(select(func.max(Event.created_at)).where(Event.kind.in_(MEANINGFUL_KINDS)))
-            errors = session.scalar(select(func.count(Event.id)).where(Event.kind.in_({"fetch_error", "storage_error"}))) or 0
-        used, quota = ObjectStore().quota_status()
+    async def quota_status(self) -> tuple[int, int]:
+        now = time.monotonic()
+        if self._quota_cache and now - self._quota_cache[0] < QUOTA_CACHE_SECONDS:
+            return self._quota_cache[1]
+        status = await asyncio.to_thread(ObjectStore().quota_status)
+        self._quota_cache = (now, status)
+        return status
+
+    async def status_text(self) -> str:
+        stats = await asyncio.to_thread(self._status_stats)
+        used, quota = await self.quota_status()
         mode = self.get_schedule_mode()
         next_run = next_scheduled_at(mode, datetime.now().astimezone())
         return ("ФСТЭК Monitor\n"
-                f"Документы: {documents}\nВложения: {attachments}\n"
-                f"Последняя проверка: {_dt(last_scan)}\nПоследнее изменение: {_dt(last_change)}\n"
-                f"Статус изменений: {'есть новые' if pending else 'изменений нет'}\n"
-                f"Хранилище: {used / 1024**3:.2f} / {quota / 1024**3:.2f} ГБ\nОшибок в журнале: {errors}\n"
+                f"Документы: {stats['documents']}\nВложения: {stats['attachments']}\n"
+                f"Последняя проверка: {_dt(stats['last_scan'])}\nПоследнее изменение: {_dt(stats['last_change'])}\n"
+                f"Статус изменений: {'есть новые' if stats['pending'] else 'изменений нет'}\n"
+                f"Хранилище: {used / 1024**3:.2f} / {quota / 1024**3:.2f} ГБ\nОшибок в журнале: {stats['errors']}\n"
                 f"Расписание: {schedule_label(mode)}\n"
                 f"Следующая проверка: {_dt(next_run) if next_run else 'выключен'}\n"
                 f"Состояние: {'проверка выполняется' if self.scan_is_running() else 'ожидание'}")
+
+    def _status_stats(self) -> dict:
+        with SessionLocal() as session:
+            return {
+                "documents": session.scalar(select(func.count(Document.id)).where(Document.active.is_(True))) or 0,
+                "attachments": session.scalar(select(func.count(Attachment.id)).where(Attachment.active.is_(True))) or 0,
+                "pending": session.scalar(select(func.count(Event.id)).where(Event.notified.is_(False), Event.kind.in_(MEANINGFUL_KINDS))) or 0,
+                "last_scan": session.scalar(select(func.max(Snapshot.fetched_at))),
+                "last_change": session.scalar(select(func.max(Event.created_at)).where(Event.kind.in_(MEANINGFUL_KINDS))),
+                "errors": session.scalar(select(func.count(Event.id)).where(Event.kind.in_(ERROR_KINDS))) or 0,
+            }
 
     def changes_text(self, limit: int = 10) -> str:
         with SessionLocal() as session:
@@ -251,6 +280,83 @@ class TelegramBot:
             lines.append(f"{identity} — ID {user.user_id}")
             buttons.append([{"text": f"✅ {identity[:30]}", "callback_data": f"access:approve:{user.user_id}"}, {"text": "❌", "callback_data": f"access:deny:{user.user_id}"}])
         return "\n".join(lines), {"inline_keyboard": buttons}
+
+    def ignored_categories_db(self) -> list[str]:
+        init_db()
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, IGNORED_SETTING_KEY)
+            value = setting.value if setting else ""
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
+    def set_ignored_categories_db(self, categories: list[str]) -> None:
+        init_db()
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, IGNORED_SETTING_KEY)
+            if setting is None:
+                setting = BotSetting(key=IGNORED_SETTING_KEY, value="\n".join(categories))
+                session.add(setting)
+            else:
+                setting.value = "\n".join(categories)
+            session.commit()
+
+    def toggle_ignored_category(self, token: str) -> str | None:
+        with SessionLocal() as session:
+            known = [c for c in session.scalars(select(Document.category).distinct()).all() if c]
+        target = next((c for c in sorted(known) if category_token(c) == token), None)
+        if target is None:
+            return None
+        ignored = self.ignored_categories_db()
+        keys = {category_key(c) for c in ignored}
+        if category_key(target) in keys:
+            self.set_ignored_categories_db([c for c in ignored if category_key(c) != category_key(target)])
+            return f"✅ Категория снова отслеживается: {target}"
+        self.set_ignored_categories_db(ignored + [target])
+        return f"🚫 Категория добавлена в игнор: {target}"
+
+    def ignore_text(self) -> tuple[str, dict | None]:
+        env_ignored = sorted(settings.ignored_category_set)
+        db_ignored = self.ignored_categories_db()
+        db_keys = {category_key(c) for c in db_ignored}
+        lines = ["Игнорируемые категории:"]
+        if env_ignored:
+            lines.append("Из конфигурации (.env):")
+            lines.extend(f"• {name}" for name in env_ignored)
+        if db_ignored:
+            lines.append("Добавлены через бота:")
+            lines.extend(f"• {name}" for name in db_ignored)
+        if not env_ignored and not db_ignored:
+            lines.append("пока нет")
+        with SessionLocal() as session:
+            known = sorted(c for c in session.scalars(select(Document.category).distinct()).all() if c)
+        buttons = []
+        for category in known[:20]:
+            ignored = category_key(category) in db_keys or category_key(category) in set(env_ignored)
+            mark = "🚫" if ignored else "👁"
+            buttons.append([{"text": f"{mark} {category[:40]}", "callback_data": f"ignore:t:{category_token(category)}"}])
+        if not buttons:
+            return "\n".join(lines), None
+        lines.append("")
+        lines.append("Нажмите на категорию, чтобы переключить игнор (🚫 — игнорируется):")
+        return "\n".join(lines), {"inline_keyboard": buttons}
+
+    def clear_errors_text(self) -> tuple[str, dict | None]:
+        with SessionLocal() as session:
+            count = session.scalar(select(func.count(Event.id)).where(Event.kind.in_(ERROR_KINDS))) or 0
+        if not count:
+            return "Журнал ошибок пуст.", None
+        return (f"В журнале ошибок {count} событий (fetch_error, storage_error).\n"
+                "Удалить их? История документов и diff'ы не затрагивается."), {
+            "inline_keyboard": [[
+                {"text": "🧹 Очистить", "callback_data": "errors:clear:confirm"},
+                {"text": "Отмена", "callback_data": "errors:clear:cancel"},
+            ]]
+        }
+
+    def clear_errors(self) -> int:
+        with SessionLocal() as session:
+            result = session.execute(delete(Event).where(Event.kind.in_(ERROR_KINDS)))
+            session.commit()
+            return result.rowcount or 0
 
     async def request_access(self, user_id: int, chat_id: int, username: str, display_name: str) -> bool:
         should_notify = False
@@ -309,6 +415,17 @@ class TelegramBot:
                 return
             await self.send(settings.telegram_admin_id, f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard())
             return
+        if data == ["errors", "clear", "cancel"]:
+            await self.send(settings.telegram_admin_id, "Очистка журнала ошибок отменена.")
+            return
+        if data == ["errors", "clear", "confirm"]:
+            deleted = await asyncio.to_thread(self.clear_errors)
+            await self.send(settings.telegram_admin_id, f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
+            return
+        if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
+            result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
+            await self.send(settings.telegram_admin_id, result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
+            return
         if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
             return
         user_id = int(data[2])
@@ -325,16 +442,15 @@ class TelegramBot:
         await self.send(target_chat, "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.")
         await self.send(settings.telegram_admin_id, f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.")
 
-    async def send_report(self, chat_id: int, event_id: int) -> None:
+    def _build_report(self, event_id: int) -> tuple[str, list[tuple[str, bytes, str]]] | None:
         store = ObjectStore()
         files: list[tuple[str, bytes, str]] = []
         with SessionLocal() as session:
             event = session.get(Event, event_id)
             if not event:
-                await self.send(chat_id, f"Событие #{event_id} не найдено.")
-                return
+                return None
             doc = session.get(Document, event.document_id) if event.document_id else None
-            report = event_report(event, doc.title if doc else "", doc.canonical_url if doc else "")
+            report = event_report_md(event, doc.title if doc else "", doc.canonical_url if doc else "")
             hashes = re.findall(r"(?:old|new)=([0-9a-f]{64})", event.details)
             if hashes:
                 versions = session.scalars(select(AttachmentVersion).where(AttachmentVersion.binary_sha256.in_(hashes))).all()
@@ -342,25 +458,34 @@ class TelegramBot:
                     path = Path(store.root) / version.object_key
                     if path.exists() and path.stat().st_size <= settings.telegram_max_file_bytes:
                         prefix = "old" if version.binary_sha256 == hashes[0] else "new"
-                        files.append((f"{prefix}-{safe_filename(doc.title if doc else 'document')}{path.suffix}", path.read_bytes(), "версия документа"))
+                        files.append((f"{prefix}-{safe_filename(doc.title if doc else 'document', suffix=path.suffix)}", path.read_bytes(), "версия документа"))
             elif doc:
                 snapshots = session.scalars(select(Snapshot).where(Snapshot.document_id == doc.id).order_by(Snapshot.id.desc()).limit(2)).all()
                 for prefix, snapshot in zip(("new", "old"), snapshots):
                     path = Path(store.root) / snapshot.normalized_text_object
                     if path.exists() and path.stat().st_size <= settings.telegram_max_file_bytes:
-                        files.append((f"{prefix}-{safe_filename(doc.title)}.txt", path.read_bytes(), "версия HTML-текста"))
-        await self.send_file(chat_id, f"event-{event_id}-report.txt", report.encode(), "Подробный отчёт")
+                        files.append((f"{prefix}-{safe_filename(doc.title)}", path.read_bytes(), "версия HTML-текста"))
+        return report, files
+
+    async def send_report(self, chat_id: int, event_id: int) -> None:
+        result = await asyncio.to_thread(self._build_report, event_id)
+        if result is None:
+            await self.send(chat_id, f"Событие #{event_id} не найдено.")
+            return
+        report, files = result
+        await self.send_file(chat_id, f"diff_{event_id}.md", report.encode(), "Подробный отчёт: old/new и diff")
         for name, data, caption in files:
             await self.send_file(chat_id, name, data, caption)
         if not files:
             await self.send(chat_id, "Старую/новую версию не отправил: файл отсутствует или превышает лимит Telegram. История сохранена на сервере.")
 
     async def handle(self, update: dict) -> None:
+        started_at = time.monotonic()
         if update.get("callback_query"):
             try:
                 await self.handle_callback(update["callback_query"])
             except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
-                await self.report_error("ошибка обработки заявки доступа", exc)
+                await self.report_error("ошибка обработки callback", exc)
             return
         message = update.get("message") or {}
         sender = message.get("from") or {}
@@ -378,37 +503,42 @@ class TelegramBot:
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
-            if command in {"/scan", "/users", "/ignore", "/settings"} and not is_admin(sender_id, settings.telegram_admin_id):
+            if command in {"/scan", "/users", "/ignore", "/settings", "/clear_errors"} and not is_admin(sender_id, settings.telegram_admin_id):
                 await self.send(chat_id, "Эта команда доступна только администратору.")
                 return
             if command in {"/start", "/help"}:
-                await self.send(chat_id, "Меню готово.\n\n/status — статистика, квота и расписание\n/changes [N] — последние изменения\n/report ID — подробный отчёт и версии\n/events — журнал\n/errors — ошибки\n/scan — проверить сейчас\n/settings — настроить расписание")
+                await self.send(chat_id, "Меню готово.\n\n/status — статистика, квота и расписание\n/changes [N] — последние изменения\n/report ID — отчёт и diff_<ID>.md с версиями\n/diff ID — то же самое\n/errors — ошибки\n/clear_errors — очистить журнал ошибок\n/ignore — управление игнором категорий\n/scan — проверить сейчас\n/settings — настроить расписание")
             elif command == "/status":
-                await self.send(chat_id, self.status_text())
+                await self.send(chat_id, await self.status_text())
             elif command in {"/changes", "/events"}:
-                await self.send(chat_id, self.changes_text(int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10))
-            elif command == "/report":
+                await self.send(chat_id, await asyncio.to_thread(self.changes_text, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10))
+            elif command in {"/report", "/diff"}:
                 if len(parts) != 2 or not parts[1].isdigit():
-                    await self.send(chat_id, "Использование: /report ID")
+                    await self.send(chat_id, f"Использование: {command} ID")
                 else:
                     await self.send_report(chat_id, int(parts[1]))
             elif command == "/errors":
                 with SessionLocal() as session:
-                    errors = session.scalars(select(Event).where(Event.kind.in_({"fetch_error", "storage_error"})).order_by(Event.id.desc()).limit(10)).all()
+                    errors = session.scalars(select(Event).where(Event.kind.in_(ERROR_KINDS)).order_by(Event.id.desc()).limit(10)).all()
                 await self.send(chat_id, "\n".join(f"#{e.id} {_dt(e.created_at)} {e.summary}: {e.details[:300]}" for e in errors) or "Ошибок нет.")
+            elif command == "/clear_errors":
+                text_out, markup = await asyncio.to_thread(self.clear_errors_text)
+                await self.send(chat_id, text_out, markup)
             elif command == "/users":
-                text, markup = self.users_text()
-                await self.send(chat_id, text, markup)
+                text_out, markup = await asyncio.to_thread(self.users_text)
+                await self.send(chat_id, text_out, markup)
             elif command == "/ignore":
-                categories = sorted(settings.ignored_category_set)
-                await self.send(chat_id, "Игнорируемые категории:\n" + "\n".join(categories) if categories else "Игнорируемых категорий нет.")
+                text_out, markup = await asyncio.to_thread(self.ignore_text)
+                await self.send(chat_id, text_out, markup)
             elif command == "/scan":
                 await self.send(chat_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
             elif command == "/settings":
-                await self.send(chat_id, self.settings_text(), settings_keyboard())
+                await self.send(chat_id, await asyncio.to_thread(self.settings_text), settings_keyboard())
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
             await self.send(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.")
+        finally:
+            log.info("command %s took %.2fs", command, time.monotonic() - started_at)
 
     async def run(self) -> None:
         init_db()

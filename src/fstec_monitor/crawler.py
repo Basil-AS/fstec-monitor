@@ -6,12 +6,13 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from .config import settings
 from .db import SessionLocal
 from .extract import semantic_text
 from .http import Fetcher, conditional_headers
-from .models import Attachment, AttachmentVersion, Document, Event, Snapshot
+from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, Snapshot
 from .normalize import normalize_document_html, sha
 from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
@@ -19,6 +20,19 @@ from .storage import ObjectStore, StorageQuotaExceeded
 
 def category_key(value: str) -> str:
     return " ".join(value.replace("\xa0", " ").split()).casefold()
+
+
+def ignored_category_keys() -> set[str]:
+    """Env-configured categories plus the ones toggled from the Telegram bot."""
+    keys = set(settings.ignored_category_set)
+    try:
+        with SessionLocal() as s:
+            row = s.get(BotSetting, "ignored_categories")
+    except SQLAlchemyError:
+        row = None
+    if row and row.value:
+        keys |= {category_key(v) for v in row.value.splitlines() if v.strip()}
+    return keys
 
 
 def snapshot_required(previous_semantic: str, current_semantic: str, has_previous: bool) -> bool:
@@ -38,13 +52,14 @@ class Monitor:
     async def discover(self) -> set[str]:
         queue=[canonicalize(settings.catalog_url)]; seen=set(); docs=set()
         prefix=canonicalize(settings.catalog_url)
+        ignored=ignored_category_keys()
         while queue:
             url=queue.pop(0)
             if url in seen: continue
             seen.add(url)
             r=await self.fetcher.get(url); r.raise_for_status()
             parsed=parse_page(r.text,str(r.url),prefix)
-            if category_key(parsed.category) in settings.ignored_category_set:
+            if category_key(parsed.category) in ignored:
                 continue
             for link in parsed.document_links:
                 if is_document_url(link.url, prefix):
@@ -79,7 +94,7 @@ class Monitor:
             raw_hash=sha(raw); html_hash=sha(normalized_html); text_hash=sha(text)
             previous_semantic=doc.current_semantic_sha256 or (previous.semantic_sha256 if previous else "")
             previous_html=doc.current_html_sha256 or (previous.html_sha256 if previous else "")
-            semantic_changed=snapshot_required(previous_semantic,text_hash,previous is None)
+            semantic_changed=snapshot_required(previous_semantic,text_hash,previous is not None)
             markup_changed=bool(previous and previous_html and previous_html!=html_hash)
             if semantic_changed:
                 raw_hash,raw_key=self.store.put(raw,".html")
@@ -145,13 +160,20 @@ def PathSuffix(url,ctype):
 
 async def run_monitor(baseline=False,limit=0):
     m=Monitor()
+    urls=[]
     try:
         with SessionLocal() as s:
+            ignored=ignored_category_keys()
             for doc in s.scalars(select(Document).where(Document.active.is_(True))).all():
-                if category_key(doc.category) in settings.ignored_category_set:
+                if category_key(doc.category) in ignored:
                     doc.active=False
             s.commit()
-        urls=sorted(await m.discover())
+        try:
+            urls=sorted(await m.discover())
+        except Exception as e:  # record crawl failure instead of dying silently
+            with SessionLocal() as s:
+                s.add(Event(kind="fetch_error",severity="critical",summary="ошибка обхода каталога",details=repr(e))); s.commit()
+            raise
         if limit: urls=urls[:limit]
         semaphore=asyncio.Semaphore(settings.max_concurrency)
         async def process(url):
