@@ -248,6 +248,20 @@ def test_getupdates_timeout_does_not_alert_admin(monkeypatch):
     assert alerts == []
 
 
+def test_transport_error_can_be_logged_without_recursive_admin_notification():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.last_error_notice = 0.0
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("transport diagnostics must not call the same broken API")
+
+    bot.send = fail_if_called
+
+    asyncio.run(bot.report_error("ошибка Telegram API", RuntimeError("upstream timeout"), notify_admin=False))
+
+
 def test_event_message_escapes_diff_for_telegram_html():
     message = format_event(SimpleNamespace(severity="info", summary="x < y", kind="diff", details="a < b"))
     assert "&lt;" in message

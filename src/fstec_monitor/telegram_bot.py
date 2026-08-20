@@ -259,9 +259,11 @@ class TelegramBot:
             # here prevents an unhandled-task warning and allows later scans.
             log.debug("background scan task finished with an error", exc_info=True)
 
-    async def report_error(self, context: str, exc: Exception) -> None:
+    async def report_error(self, context: str, exc: Exception, *, notify_admin: bool = True) -> None:
         now = time.monotonic()
-        log.error("%s: %s", context, exc)
+        log.warning("%s (%s): %s", context, type(exc).__name__, str(exc)[:300])
+        if not notify_admin:
+            return
         if now - self.last_error_notice < 60:
             return
         self.last_error_notice = now
@@ -628,7 +630,7 @@ class TelegramBot:
         try:
             await self.configure_menu()
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
-            await self.report_error("не удалось настроить меню Telegram", exc)
+            await self.report_error("не удалось настроить меню Telegram", exc, notify_admin=False)
         self.schedule_mode = self.get_schedule_mode()
         self.next_scan_at = next_scheduled_at(self.schedule_mode, datetime.now().astimezone())
         while True:
@@ -654,7 +656,7 @@ class TelegramBot:
                 log.info("getUpdates %s, retrying long poll", type(exc).__name__)
                 await asyncio.sleep(1)
             except (httpx.HTTPError, RuntimeError) as exc:
-                await self.report_error("ошибка Telegram API", exc)
+                await self.report_error("ошибка Telegram API", exc, notify_admin=False)
                 await asyncio.sleep(5)
 
 
