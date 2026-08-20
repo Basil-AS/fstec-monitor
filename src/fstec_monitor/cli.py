@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 import typer
@@ -13,6 +14,7 @@ from .models import Event
 from .notify import notify_pending
 
 app=typer.Typer(no_args_is_help=True); console=Console()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 @app.command()
 def init():

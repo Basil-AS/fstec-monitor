@@ -7,7 +7,12 @@ from sqlalchemy.orm import sessionmaker
 
 import fstec_monitor.telegram_bot as telegram_bot_module
 from fstec_monitor.models import Base, Document, Event, Snapshot
-from fstec_monitor.notify import format_event, should_notify_event
+from fstec_monitor.notify import (
+    format_change_digest,
+    format_event,
+    should_notify_event,
+    split_new_errors,
+)
 from fstec_monitor.reports import event_report, event_report_md
 from fstec_monitor.storage import ObjectStore
 from fstec_monitor.telegram_bot import (
@@ -34,7 +39,7 @@ def test_only_configured_admin_is_authorized():
 
 def test_admin_menu_contains_only_expected_commands():
     commands = telegram_commands()
-    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "diff", "errors", "clear_errors", "scan", "users", "ignore", "settings", "help"]
+    assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "clear_errors", "scan", "users", "ignore", "settings", "help"]
     assert admin_keyboard()["keyboard"][0] == [{"text": "/status"}, {"text": "/changes"}]
     assert admin_keyboard()["is_persistent"] is True
 
@@ -42,8 +47,16 @@ def test_admin_menu_contains_only_expected_commands():
 def test_admin_menu_exposes_settings_and_manual_scan():
     labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
 
-    assert "⚙️ Настройки" in labels
-    assert "🔍 Проверить сейчас" in labels
+    assert "/settings" in labels
+    assert "/scan" in labels
+
+
+def test_admin_reply_keyboard_uses_the_same_command_labels_as_command_menu():
+    command_labels = {f"/{item['command']}" for item in telegram_commands()}
+    labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
+
+    assert len(labels) == len(set(labels))
+    assert set(labels) <= command_labels
 
 
 def test_settings_keyboard_contains_all_schedule_modes():
@@ -153,10 +166,46 @@ def test_run_does_not_start_scan_immediately(monkeypatch):
     assert started == []
 
 
+def test_one_bad_update_is_reported_without_stopping_polling():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    reported = []
+
+    async def broken_handle(_update):
+        raise KeyError("malformed update")
+
+    async def report_error(context, exc):
+        reported.append((context, type(exc).__name__))
+
+    bot.handle = broken_handle
+    bot.report_error = report_error
+
+    asyncio.run(bot.handle_update_safely({"update_id": 1}))
+
+    assert reported == [("ошибка обработки update", "KeyError")]
+
+
 def test_scan_is_not_running_before_first_background_task():
     bot = TelegramBot.__new__(TelegramBot)
     bot.scan_task = None
     assert not bot.scan_is_running()
+
+
+def test_completed_background_scan_task_is_consumed_and_cleared():
+    import asyncio
+
+    async def run():
+        bot = TelegramBot.__new__(TelegramBot)
+        bot.scan_task = None
+        task = asyncio.create_task(asyncio.sleep(0, result=3))
+        bot.scan_task = task
+        task.add_done_callback(bot._scan_task_done)
+        await task
+        await asyncio.sleep(0)
+        assert bot.scan_task is None
+
+    asyncio.run(run())
 
 
 def test_getupdates_timeout_does_not_alert_admin(monkeypatch):
@@ -213,6 +262,36 @@ def test_event_message_contains_document_link():
 def test_markup_only_events_are_not_sent():
     assert not should_notify_event(SimpleNamespace(kind="html_markup_changed"))
     assert should_notify_event(SimpleNamespace(kind="html_content_changed"))
+    assert not should_notify_event(SimpleNamespace(kind="fetch_error"))
+    assert not should_notify_event(SimpleNamespace(kind="storage_error"))
+
+
+def test_repeated_error_is_silenced_after_first_delivery():
+    first = SimpleNamespace(kind="fetch_error", document_id=7, summary="каталог недоступен", notified=False)
+    repeat = SimpleNamespace(kind="fetch_error", document_id=7, summary="каталог недоступен", notified=False)
+
+    unique, duplicates = split_new_errors([repeat], [first])
+
+    assert unique == []
+    assert duplicates == [repeat]
+
+
+def test_change_digest_combines_real_changes_into_one_compact_message():
+    events = [
+        SimpleNamespace(id=1, kind="document_added", severity="warning", summary="Новый документ", document_id=4),
+        SimpleNamespace(id=2, kind="html_content_changed", severity="critical", summary="Изменён документ", document_id=4),
+    ]
+    documents = {4: SimpleNamespace(canonical_url="https://example.test/doc")}
+
+    text = format_change_digest(events, documents)
+
+    assert "Изменения ФСТЭК: 2" in text
+    assert "Новый документ" in text
+    assert text.count("https://example.test/doc") == 2
+
+
+def test_document_lifecycle_events_are_included_in_bot_status_and_changes():
+    assert telegram_bot_module.MEANINGFUL_KINDS >= {"document_removed", "document_restored"}
 
 
 def test_event_report_contains_old_new_and_diff():

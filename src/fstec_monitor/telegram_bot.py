@@ -38,7 +38,16 @@ from .schedule import (
 from .storage import ObjectStore
 
 log = logging.getLogger(__name__)
-MEANINGFUL_KINDS = {"document_added", "html_content_changed", "attachment_added", "attachment_removed", "attachment_content_changed", "attachment_binary_changed"}
+MEANINGFUL_KINDS = {
+    "document_added",
+    "document_removed",
+    "document_restored",
+    "html_content_changed",
+    "attachment_added",
+    "attachment_removed",
+    "attachment_content_changed",
+    "attachment_binary_changed",
+}
 ERROR_KINDS = ("fetch_error", "storage_error")
 IGNORED_SETTING_KEY = "ignored_categories"
 QUOTA_CACHE_SECONDS = 300
@@ -47,7 +56,6 @@ ADMIN_COMMANDS = (
     ("status", "статистика и квота"),
     ("changes", "последние изменения"),
     ("report", "отчёт по ID события"),
-    ("diff", "diff изменения как Markdown-файл"),
     ("errors", "последние ошибки"),
     ("clear_errors", "очистить журнал ошибок"),
     ("scan", "запустить проверку"),
@@ -76,8 +84,7 @@ def admin_keyboard() -> dict:
             [{"text": "/status"}, {"text": "/changes"}],
             [{"text": "/scan"}, {"text": "/errors"}],
             [{"text": "/users"}, {"text": "/ignore"}],
-            [{"text": "🔍 Проверить сейчас"}, {"text": "⚙️ Настройки"}],
-            [{"text": "/help"}],
+            [{"text": "/settings"}, {"text": "/help"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -237,7 +244,20 @@ class TelegramBot:
         if self.scan_is_running():
             return False
         self.scan_task = asyncio.create_task(self._scan_task(trigger))
+        self.scan_task.add_done_callback(self._scan_task_done)
         return True
+
+    def _scan_task_done(self, task: asyncio.Task[int]) -> None:
+        if self.scan_task is task:
+            self.scan_task = None
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            # _scan_task already reports the failure. Retrieving the result
+            # here prevents an unhandled-task warning and allows later scans.
+            log.debug("background scan task finished with an error", exc_info=True)
 
     async def report_error(self, context: str, exc: Exception) -> None:
         now = time.monotonic()
@@ -548,9 +568,6 @@ class TelegramBot:
                 and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
             return
         parts = text.split()
-        text_commands = {"🔍 Проверить сейчас": "/scan", "⚙️ Настройки": "/settings"}
-        text = text_commands.get(text, text)
-        parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
             if command in {"/scan", "/users", "/ignore", "/settings", "/clear_errors"} and not is_admin(sender_id, settings.telegram_admin_id):
@@ -598,6 +615,14 @@ class TelegramBot:
         finally:
             log.info("command %s took %.2fs", command, time.monotonic() - started_at)
 
+    async def handle_update_safely(self, update: dict) -> None:
+        """Keep one malformed update from terminating the long-poll loop."""
+        try:
+            await self.handle(update)
+        except Exception as exc:
+            log.exception("failed to process Telegram update")
+            await self.report_error("ошибка обработки update", exc)
+
     async def run(self) -> None:
         init_db()
         try:
@@ -622,7 +647,7 @@ class TelegramBot:
                 updates = await self.call("getUpdates", payload)
                 for update in updates:
                     self.offset = update["update_id"] + 1
-                    await self.handle(update)
+                    await self.handle_update_safely(update)
             except httpx.TimeoutException as exc:
                 # Long polling sits on a slow request by design; a read timeout is
                 # a transient blip, not an incident worth paging the admin about.
@@ -634,6 +659,7 @@ class TelegramBot:
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     bot = TelegramBot()
     try:
         await bot.run()

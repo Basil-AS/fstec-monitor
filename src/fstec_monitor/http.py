@@ -31,5 +31,6 @@ class Fetcher:
                 return r
             except (httpx.TransportError,httpx.HTTPStatusError) as e:
                 last=e
-                await asyncio.sleep(min(60, 5*(2**attempt)))
+                if attempt + 1 < settings.max_retries:
+                    await asyncio.sleep(min(60, 5*(2**attempt)))
         raise RuntimeError(f"failed to fetch {url}: {last}")

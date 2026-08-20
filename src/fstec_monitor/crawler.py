@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
@@ -16,6 +17,9 @@ from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, 
 from .normalize import normalize_document_html, sha
 from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
+
+log = logging.getLogger(__name__)
+REMOVAL_CONFIRMATION_RUNS = 2
 
 
 def category_key(value: str) -> str:
@@ -37,6 +41,48 @@ def ignored_category_keys() -> set[str]:
 
 def snapshot_required(previous_semantic: str, current_semantic: str, has_previous: bool) -> bool:
     return not has_previous or previous_semantic != current_semantic
+
+
+def reconcile_document_presence(session, seen_urls: set[str], baseline: bool = False) -> None:
+    """Reconcile a completed catalog discovery with stored document state.
+
+    A document must be absent from two complete discoveries before it is
+    considered removed. This protects against transient catalog failures and
+    makes removal notifications one-shot; a later sighting records a restore.
+    """
+    now = datetime.now(UTC)
+    documents = session.scalars(select(Document)).all()
+    for document in documents:
+        if document.canonical_url in seen_urls:
+            was_inactive = not document.active
+            document.active = True
+            document.missing_runs = 0
+            document.last_seen_at = now
+            if was_inactive and not baseline:
+                session.add(Event(
+                    document_id=document.id,
+                    kind="document_restored",
+                    severity="warning",
+                    summary=f"восстановлен документ: {document.title or document.canonical_url}",
+                    details=document.canonical_url,
+                    notified=False,
+                ))
+            continue
+        if not document.active:
+            continue
+        document.missing_runs += 1
+        if document.missing_runs < REMOVAL_CONFIRMATION_RUNS:
+            continue
+        document.active = False
+        if not baseline:
+            session.add(Event(
+                document_id=document.id,
+                kind="document_removed",
+                severity="warning",
+                summary=f"удалён документ: {document.title or document.canonical_url}",
+                details=document.canonical_url,
+                notified=False,
+            ))
 
 
 async def gather_workers(workers):
@@ -161,6 +207,7 @@ def PathSuffix(url,ctype):
 async def run_monitor(baseline=False,limit=0,trigger="cli"):
     m=Monitor()
     urls=[]; error=""; started=datetime.now(UTC)
+    log.info("scan started trigger=%s baseline=%s limit=%s", trigger, baseline, limit or "none")
     try:
         with SessionLocal() as s:
             ignored=ignored_category_keys()
@@ -175,6 +222,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
                 s.add(Event(kind="fetch_error",severity="critical",summary="ошибка обхода каталога",details=repr(e))); s.commit()
             raise
         if limit: urls=urls[:limit]
+        log.info("catalog discovery completed documents=%d", len(urls))
         semaphore=asyncio.Semaphore(settings.max_concurrency)
         async def process(url):
             async with semaphore:
@@ -186,6 +234,10 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
         await gather_workers(process(url) for url in urls)
+        with SessionLocal() as s:
+            reconcile_document_presence(s, set(urls), baseline=baseline)
+            s.commit()
+        log.info("scan workers completed documents=%d", len(urls))
     except Exception as e:
         error=repr(e)
         raise
@@ -197,4 +249,5 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
                 s.commit()
         except SQLAlchemyError:  # history must never break the scan itself
             pass
+        log.info("scan finished trigger=%s documents=%d error=%s", trigger, len(urls), bool(error))
     return len(urls)

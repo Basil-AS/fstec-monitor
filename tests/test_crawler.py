@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from fstec_monitor import crawler
 from fstec_monitor.crawler import Monitor, category_key, snapshot_required
-from fstec_monitor.models import Base, Event, ScanRun, Snapshot
+from fstec_monitor.models import Base, Document, Event, ScanRun, Snapshot
 
 
 def test_category_key_normalizes_nbsp_and_case():
@@ -77,6 +77,46 @@ def test_changed_document_creates_new_snapshot(monkeypatch, tmp_path):
     asyncio.run(run())
     with session_factory() as session:
         assert session.scalar(select(func.count(Snapshot.id))) == 2
+
+
+def test_reconcile_documents_confirms_removal_and_does_not_repeat_event(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/reconcile.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with session_factory() as session:
+        document = Document(canonical_url="https://fstec.ru/dokumenty/vse-dokumenty/cat/doc", title="Doc")
+        session.add(document)
+        session.commit()
+
+        crawler.reconcile_document_presence(session, set(), baseline=False)
+        assert document.active is True
+        assert document.missing_runs == 1
+        assert session.scalar(select(func.count(Event.id))) == 0
+
+        crawler.reconcile_document_presence(session, set(), baseline=False)
+        assert document.active is False
+        assert document.missing_runs == 2
+        assert session.scalar(select(func.count(Event.id)).where(Event.kind == "document_removed")) == 1
+
+        crawler.reconcile_document_presence(session, set(), baseline=False)
+        assert session.scalar(select(func.count(Event.id)).where(Event.kind == "document_removed")) == 1
+
+
+def test_reconcile_documents_records_restoration(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/restore.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
+    with session_factory() as session:
+        document = Document(canonical_url=url, title="Doc", active=False, missing_runs=2)
+        session.add(document)
+        session.commit()
+
+        crawler.reconcile_document_presence(session, {url}, baseline=False)
+
+        assert document.active is True
+        assert document.missing_runs == 0
+        assert session.scalar(select(func.count(Event.id)).where(Event.kind == "document_restored")) == 1
 
 
 class _FakeMonitor:
