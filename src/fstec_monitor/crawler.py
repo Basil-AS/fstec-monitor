@@ -151,10 +151,27 @@ class Monitor:
                     old=self.store.read(previous.normalized_text_object).decode(errors="replace")
                     diff="\n".join(difflib.unified_diff(old.splitlines(),text.splitlines(),fromfile="old",tofile="new",n=3))[:12000]
                     self.event(s,doc,"html_content_changed","critical",f"изменена страница: {doc.title or url}",diff)
-            elif markup_changed and not baseline:
-                old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
-                diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
-                self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
+            elif markup_changed:
+                raw_hash, raw_key = self.store.put(raw, ".html")
+                html_hash, html_key = self.store.put(normalized_html.encode(), ".normalized.html")
+                text_hash, text_key = self.store.put(text.encode(), ".txt")
+                s.add(Snapshot(
+                    document_id=doc.id,
+                    status_code=r.status_code,
+                    final_url=str(r.url),
+                    raw_sha256=raw_hash,
+                    semantic_sha256=text_hash,
+                    html_sha256=html_hash,
+                    raw_object=raw_key,
+                    normalized_html_object=html_key,
+                    normalized_text_object=text_key,
+                    etag=r.headers.get("etag", ""),
+                    last_modified=r.headers.get("last-modified", ""),
+                ))
+                if not baseline:
+                    old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
+                    diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
+                    self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
             doc.current_html_sha256=html_hash; doc.current_semantic_sha256=text_hash; doc.current_etag=r.headers.get("etag", ""); doc.current_last_modified=r.headers.get("last-modified", "")
             doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
             active_urls={a.url for a in parsed.attachments}

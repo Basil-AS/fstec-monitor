@@ -15,7 +15,7 @@ def test_category_key_normalizes_nbsp_and_case():
     assert category_key("  Информационные   и аналитические материалы ") == "информационные и аналитические материалы"
 
 
-def test_markup_only_change_does_not_require_archived_snapshot():
+def test_markup_only_change_does_not_require_semantic_change():
     assert not snapshot_required("same", "same", True)
     assert snapshot_required("old", "new", True)
     assert snapshot_required("", "new", False)
@@ -77,6 +77,31 @@ def test_changed_document_creates_new_snapshot(monkeypatch, tmp_path):
     asyncio.run(run())
     with session_factory() as session:
         assert session.scalar(select(func.count(Snapshot.id))) == 2
+
+
+def test_markup_only_change_archives_latest_html_and_reports_markup_event(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/crawler.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    async def run():
+        monitor = Monitor()
+        url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
+        monitor.fetcher = _FakeFetcher(_HTML)
+        await monitor.process_document(url, baseline=True)
+        markup_only = _HTML.replace("<p>Content line</p>", "<p><strong>Content</strong> line</p>")
+        monitor.fetcher = _FakeFetcher(markup_only)
+        await monitor.process_document(url)
+
+    asyncio.run(run())
+    with session_factory() as session:
+        assert session.scalar(select(func.count(Snapshot.id))) == 2
+        event = session.scalar(select(Event).where(Event.kind == "html_markup_changed"))
+        assert event is not None
+        assert session.scalar(select(Event).where(Event.kind == "html_content_changed")) is None
+        assert "<strong>" in event.details
 
 
 def test_reconcile_documents_confirms_removal_and_does_not_repeat_event(tmp_path):
