@@ -64,7 +64,7 @@
 - Modify: `docs/superpowers/specs/2026-08-21-scan-progress-control-design.md`
 - Test: full suite
 
-- [ ] Добавить в README описание состояний, кнопок, остановки и повторного запуска.
-- [ ] Запустить полный `pytest`, Ruff и compileall.
-- [ ] Синхронизировать только исходники бота на `mxbox` без `--delete`, перезапустить service и проверить `systemctl`, journal, live catalog и smoke callbacks.
-- [ ] Зафиксировать remote результат и оставить незакрытые сетевые ошибки в журнале.
+- [x] Добавить в README описание состояний, кнопок, остановки и повторного запуска.
+- [x] Запустить полный `pytest`, Ruff и compileall.
+- [x] Синхронизировать только исходники бота на `mxbox` без `--delete`, перезапустить service и проверить `systemctl`, journal, live catalog и smoke callbacks.
+- [x] Зафиксировать remote результат и оставить незакрытые сетевые ошибки в журнале.
