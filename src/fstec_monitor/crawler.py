@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
@@ -16,6 +17,9 @@ from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, 
 from .normalize import normalize_document_html, sha
 from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
+
+log = logging.getLogger(__name__)
+REMOVAL_CONFIRMATION_RUNS = 2
 
 
 def category_key(value: str) -> str:
@@ -37,6 +41,48 @@ def ignored_category_keys() -> set[str]:
 
 def snapshot_required(previous_semantic: str, current_semantic: str, has_previous: bool) -> bool:
     return not has_previous or previous_semantic != current_semantic
+
+
+def reconcile_document_presence(session, seen_urls: set[str], baseline: bool = False) -> None:
+    """Reconcile a completed catalog discovery with stored document state.
+
+    A document must be absent from two complete discoveries before it is
+    considered removed. This protects against transient catalog failures and
+    makes removal notifications one-shot; a later sighting records a restore.
+    """
+    now = datetime.now(UTC)
+    documents = session.scalars(select(Document)).all()
+    for document in documents:
+        if document.canonical_url in seen_urls:
+            was_inactive = not document.active
+            document.active = True
+            document.missing_runs = 0
+            document.last_seen_at = now
+            if was_inactive and not baseline:
+                session.add(Event(
+                    document_id=document.id,
+                    kind="document_restored",
+                    severity="warning",
+                    summary=f"восстановлен документ: {document.title or document.canonical_url}",
+                    details=document.canonical_url,
+                    notified=False,
+                ))
+            continue
+        if not document.active:
+            continue
+        document.missing_runs += 1
+        if document.missing_runs < REMOVAL_CONFIRMATION_RUNS:
+            continue
+        document.active = False
+        if not baseline:
+            session.add(Event(
+                document_id=document.id,
+                kind="document_removed",
+                severity="warning",
+                summary=f"удалён документ: {document.title or document.canonical_url}",
+                details=document.canonical_url,
+                notified=False,
+            ))
 
 
 async def gather_workers(workers):
@@ -105,10 +151,27 @@ class Monitor:
                     old=self.store.read(previous.normalized_text_object).decode(errors="replace")
                     diff="\n".join(difflib.unified_diff(old.splitlines(),text.splitlines(),fromfile="old",tofile="new",n=3))[:12000]
                     self.event(s,doc,"html_content_changed","critical",f"изменена страница: {doc.title or url}",diff)
-            elif markup_changed and not baseline:
-                old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
-                diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
-                self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
+            elif markup_changed:
+                raw_hash, raw_key = self.store.put(raw, ".html")
+                html_hash, html_key = self.store.put(normalized_html.encode(), ".normalized.html")
+                text_hash, text_key = self.store.put(text.encode(), ".txt")
+                s.add(Snapshot(
+                    document_id=doc.id,
+                    status_code=r.status_code,
+                    final_url=str(r.url),
+                    raw_sha256=raw_hash,
+                    semantic_sha256=text_hash,
+                    html_sha256=html_hash,
+                    raw_object=raw_key,
+                    normalized_html_object=html_key,
+                    normalized_text_object=text_key,
+                    etag=r.headers.get("etag", ""),
+                    last_modified=r.headers.get("last-modified", ""),
+                ))
+                if not baseline:
+                    old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
+                    diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
+                    self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
             doc.current_html_sha256=html_hash; doc.current_semantic_sha256=text_hash; doc.current_etag=r.headers.get("etag", ""); doc.current_last_modified=r.headers.get("last-modified", "")
             doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
             active_urls={a.url for a in parsed.attachments}
@@ -158,10 +221,15 @@ def PathSuffix(url,ctype):
     if "opendocument" in ctype:return ".odt"
     return ".bin"
 
-async def run_monitor(baseline=False,limit=0,trigger="cli"):
+async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=None,cancel_event=None):
     m=Monitor()
-    urls=[]; error=""; started=datetime.now(UTC)
+    urls=[]; error=""; started=datetime.now(UTC); completed=0; errors_count=0
+    def report(stage, done, total, errors):
+        if progress_callback:
+            progress_callback(stage, done, total, errors)
+    log.info("scan started trigger=%s baseline=%s limit=%s", trigger, baseline, limit or "none")
     try:
+        report("Обход каталога", 0, 0, 0)
         with SessionLocal() as s:
             ignored=ignored_category_keys()
             for doc in s.scalars(select(Document).where(Document.active.is_(True))).all():
@@ -175,18 +243,34 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
                 s.add(Event(kind="fetch_error",severity="critical",summary="ошибка обхода каталога",details=repr(e))); s.commit()
             raise
         if limit: urls=urls[:limit]
+        log.info("catalog discovery completed documents=%d", len(urls))
+        report("Проверка документов", 0, len(urls), 0)
         semaphore=asyncio.Semaphore(settings.max_concurrency)
         async def process(url):
+            nonlocal completed, errors_count
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError
             async with semaphore:
                 try: await m.process_document(url,baseline)
                 except StorageQuotaExceeded as e:
+                    errors_count += 1
                     with SessionLocal() as s:
                         s.add(Event(kind="storage_error", severity="critical", summary=f"квота хранилища достигнута при загрузке {url}", details=str(e))); s.commit()
                 except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
+                    errors_count += 1
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
+                finally:
+                    completed += 1
+                    report("Проверка документов", completed, len(urls), errors_count)
         await gather_workers(process(url) for url in urls)
-    except Exception as e:
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError
+        with SessionLocal() as s:
+            reconcile_document_presence(s, set(urls), baseline=baseline)
+            s.commit()
+        log.info("scan workers completed documents=%d", len(urls))
+    except BaseException as e:
         error=repr(e)
         raise
     finally:
@@ -197,4 +281,5 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
                 s.commit()
         except SQLAlchemyError:  # history must never break the scan itself
             pass
+        log.info("scan finished trigger=%s documents=%d error=%s", trigger, len(urls), bool(error))
     return len(urls)

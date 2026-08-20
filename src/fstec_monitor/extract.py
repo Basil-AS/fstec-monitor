@@ -11,8 +11,8 @@ from .normalize import normalize_space
 
 def extract_pdf(data: bytes) -> str:
     try:
-        import fitz
-        doc=fitz.open(stream=data, filetype="pdf")
+        import pymupdf
+        doc=pymupdf.open(stream=data, filetype="pdf")
         return "\n\n".join(page.get_text("text") for page in doc)
     except (OSError, RuntimeError, ValueError):
         return ""
