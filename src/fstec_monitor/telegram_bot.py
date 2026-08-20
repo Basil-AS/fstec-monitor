@@ -454,7 +454,7 @@ class TelegramBot:
         log.warning("%s (%s)", context, type(exc).__name__)
         if not notify_admin:
             return
-        if now - self.last_error_notice < 60:
+        if self.last_error_notice and now - self.last_error_notice < 60:
             return
         self.last_error_notice = now
         try:
