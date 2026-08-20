@@ -623,6 +623,11 @@ class TelegramBot:
                 for update in updates:
                     self.offset = update["update_id"] + 1
                     await self.handle(update)
+            except httpx.TimeoutException as exc:
+                # Long polling sits on a slow request by design; a read timeout is
+                # a transient blip, not an incident worth paging the admin about.
+                log.info("getUpdates %s, retrying long poll", type(exc).__name__)
+                await asyncio.sleep(1)
             except (httpx.HTTPError, RuntimeError) as exc:
                 await self.report_error("ошибка Telegram API", exc)
                 await asyncio.sleep(5)
