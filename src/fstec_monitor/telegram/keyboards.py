@@ -36,12 +36,29 @@ def _reply_keyboard(labels: tuple[tuple[str, str], ...], placeholder: str) -> di
     }
 
 
+def _inline_keyboard(labels: tuple[tuple[str, str], ...]) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": encode_callback("screen", action)}]
+            for label, action in labels
+        ]
+    }
+
+
 def admin_keyboard() -> dict:
     return _reply_keyboard(ADMIN_LABELS, "Выберите действие или введите команду")
 
 
 def user_keyboard() -> dict:
     return _reply_keyboard(USER_LABELS, "Выберите действие")
+
+
+def inline_admin_keyboard() -> dict:
+    return _inline_keyboard(ADMIN_LABELS)
+
+
+def inline_user_keyboard() -> dict:
+    return _inline_keyboard(USER_LABELS)
 
 
 def settings_keyboard(notifications_enabled: bool = True) -> dict:

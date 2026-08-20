@@ -13,6 +13,8 @@ _ALLOWED_ACTIONS: Final = {
     "ignore",
     "users",
     "errors",
+    "screen",
+    "nav",
 }
 
 
