@@ -159,6 +159,46 @@ def test_scan_is_not_running_before_first_background_task():
     assert not bot.scan_is_running()
 
 
+def test_getupdates_timeout_does_not_alert_admin(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    class StopRun(Exception):
+        pass
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.offset = None
+    bot.get_schedule_mode = lambda: "disabled"
+    bot.start_scan = lambda *_args: None
+    alerts = []
+
+    async def configure_menu():
+        return None
+
+    async def report_error(context, exc):
+        alerts.append(context)
+
+    calls = []
+
+    async def call(method, _payload):
+        calls.append(method)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("slow poll")
+        raise StopRun
+
+    bot.configure_menu = configure_menu
+    bot.report_error = report_error
+    bot.call = call
+    monkeypatch.setattr(telegram_bot_module, "init_db", lambda: None)
+
+    with pytest.raises(StopRun):
+        asyncio.run(bot.run())
+
+    assert calls == ["getUpdates", "getUpdates"]
+    assert alerts == []
+
+
 def test_event_message_escapes_diff_for_telegram_html():
     message = format_event(SimpleNamespace(severity="info", summary="x < y", kind="diff", details="a < b"))
     assert "&lt;" in message
