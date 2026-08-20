@@ -916,7 +916,9 @@ class TelegramBot:
             elif command == "/status":
                 status_text = await self.status_text()
                 _, status_markup = self.scan_progress_card()
-                await self.send(chat_id, status_text, status_markup)
+                message_id = await self.send(chat_id, status_text, status_markup)
+                if message_id and is_admin(sender_id, settings.telegram_admin_id) and self.scan_is_running():
+                    self.remember_scan_message(chat_id, message_id)
             elif command in {"/changes", "/events"}:
                 await self.send(chat_id, await asyncio.to_thread(self.changes_text, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10))
             elif command in {"/report", "/diff"}:
@@ -943,7 +945,9 @@ class TelegramBot:
             elif command == "/scan":
                 if self.scan_is_running():
                     progress_text, progress_markup = self.scan_progress_card()
-                    await self.send(chat_id, progress_text, progress_markup)
+                    message_id = await self.send(chat_id, progress_text, progress_markup)
+                    if message_id and is_admin(sender_id, settings.telegram_admin_id):
+                        self.remember_scan_message(chat_id, message_id)
                 else:
                     await self.send(chat_id, "Запустить полную проверку каталога ФСТЭК сейчас?", {
                         "inline_keyboard": [[
