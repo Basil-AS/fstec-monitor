@@ -21,7 +21,8 @@ def format_event(e: Event, document_url: str = "") -> str:
 
 
 def should_notify_event(e: Event) -> bool:
-    return True
+    # Markup-only churn (counters, layout) stays in the journal but is not pushed to Telegram.
+    return e.kind != "html_markup_changed"
 
 async def notify_pending(session) -> int:
     if not settings.telegram_bot_token or not settings.telegram_chat_id: return 0

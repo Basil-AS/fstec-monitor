@@ -31,6 +31,32 @@ def event_report(event: Event, title: str = "Документ", url: str = "") -
     )
 
 
+def event_report_md(event: Event, title: str = "Документ", url: str = "") -> str:
+    details = event.details or "нет подробностей"
+    is_diff = details.lstrip().startswith(("--- ", "@@"))
+    body = f"```diff\n{details}\n```" if is_diff else details
+    return "\n".join(
+        (
+            f"# Отчёт об изменении · событие #{event.id}",
+            "",
+            f"- Время: {fmt_dt(event.created_at)}",
+            f"- Тип: `{event.kind}`",
+            f"- Важность: `{event.severity}`",
+            f"- Документ: {title}",
+            f"- URL: {url or 'нет данных'}",
+            "",
+            "## Кратко",
+            "",
+            event.summary,
+            "",
+            "## До / после (unified diff)",
+            "",
+            body,
+            "",
+        )
+    )
+
+
 def safe_filename(name: str, suffix: str = ".txt") -> str:
     clean = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name).strip("._")
     return (clean[:80] or "fstec-report") + suffix

@@ -1,9 +1,8 @@
 [Unit]
-Description=Run FSTEC monitor every two hours
+Description=Run FSTEC monitor once daily at noon
 
 [Timer]
-OnCalendar=*-*-* 00/2:15:00
-RandomizedDelaySec=10m
+OnCalendar=*-*-* 12:00:00
 Persistent=true
 
 [Install]

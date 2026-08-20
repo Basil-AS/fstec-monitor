@@ -101,3 +101,9 @@ class UserAccess(Base):
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notification_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class BotSetting(Base):
+    __tablename__ = "bot_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
