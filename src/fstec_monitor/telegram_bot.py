@@ -189,6 +189,10 @@ class TelegramBot:
         self.scan_task: asyncio.Task[int] | None = None
         self.scan_cancel_event = asyncio.Event()
         self.scan_progress = ScanProgress()
+        self.scan_status_message: tuple[int, int] | None = None
+        self.scan_status_update_task: asyncio.Task | None = None
+        self.scan_status_last_update = 0.0
+        self._temporary_delete_tasks: set[asyncio.Task] = set()
         self.next_scan_at: datetime | None = None
         self.schedule_mode: str | None = None
         self.client = httpx.AsyncClient(timeout=40)
@@ -196,6 +200,8 @@ class TelegramBot:
         self._quota_cache: tuple[float, tuple[int, int]] | None = None
 
     async def close(self) -> None:
+        for task in getattr(self, "_temporary_delete_tasks", set()):
+            task.cancel()
         await self.client.aclose()
 
     async def call(self, method: str, payload: dict) -> dict:
@@ -206,16 +212,59 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
         return body.get("result", {})
 
-    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
+        message_id = None
         for start in range(0, len(text), 3900):
-            payload = {"chat_id": chat_id, "text": text[start:start + 3900], "disable_web_page_preview": True}
+            payload = {
+                "chat_id": chat_id,
+                "text": text[start:start + 3900],
+                "link_preview_options": {"is_disabled": True},
+            }
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
             elif chat_id == settings.telegram_admin_id:
                 payload["reply_markup"] = admin_keyboard()
             else:
                 payload["reply_markup"] = user_keyboard()
-            await self.call("sendMessage", payload)
+            result = await self.call("sendMessage", payload)
+            if isinstance(result, dict):
+                message_id = result.get("message_id", message_id)
+        return message_id
+
+    async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        await self.call("editMessageText", payload)
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        await self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+    async def _delete_later(self, chat_id: int, message_id: int, ttl: float) -> None:
+        await asyncio.sleep(ttl)
+        try:
+            await self.delete_message(chat_id, message_id)
+        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+            log.debug("temporary Telegram message already gone chat=%s message=%s: %s", chat_id, message_id, exc)
+
+    async def send_temporary(self, chat_id: int, text: str, ttl: float = 8.0) -> None:
+        for start in range(0, len(text), 3900):
+            result = await self.call("sendMessage", {
+                "chat_id": chat_id,
+                "text": text[start:start + 3900],
+                "link_preview_options": {"is_disabled": True},
+            })
+            if isinstance(result, dict) and result.get("message_id"):
+                task = asyncio.create_task(self._delete_later(chat_id, result["message_id"], ttl))
+                tasks = getattr(self, "_temporary_delete_tasks", set())
+                tasks.add(task)
+                self._temporary_delete_tasks = tasks
+                task.add_done_callback(tasks.discard)
 
     async def configure_menu(self) -> None:
         await self.call("setMyCommands", {
@@ -268,18 +317,22 @@ class TelegramBot:
             self.scan_progress.stage = "Проверка завершена"
             self.scan_progress.documents = count
             self.scan_progress.finished_at = datetime.now(UTC)
-            await self.send(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. Длительность: {_fmt_duration(time.monotonic() - started)}. /status")
+            await self.refresh_scan_status()
+            if getattr(self, "scan_status_message", None) is None:
+                await self.send_temporary(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. Длительность: {_fmt_duration(time.monotonic() - started)}.")
             return count
         except asyncio.CancelledError:
             self.scan_progress.state = "cancelled"
             self.scan_progress.stage = "Проверка остановлена"
             self.scan_progress.finished_at = datetime.now(UTC)
+            await self.refresh_scan_status()
             raise
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             self.scan_progress.state = "failed"
             self.scan_progress.stage = "Проверка завершилась с ошибкой"
             self.scan_progress.last_error = str(exc)[:500]
             self.scan_progress.finished_at = datetime.now(UTC)
+            await self.refresh_scan_status()
             log.exception("background scan failed")
             await self.report_error("ошибка фоновой проверки", exc)
             raise
@@ -357,6 +410,29 @@ class TelegramBot:
         self.scan_progress.completed = completed
         self.scan_progress.total = total
         self.scan_progress.errors = errors
+        now = time.monotonic()
+        message = getattr(self, "scan_status_message", None)
+        if message and now - getattr(self, "scan_status_last_update", 0.0) >= 2:
+            self.scan_status_last_update = now
+            update_task = getattr(self, "scan_status_update_task", None)
+            if update_task is None or update_task.done():
+                self.scan_status_update_task = asyncio.create_task(self.refresh_scan_status())
+
+    def remember_scan_message(self, chat_id: int, message_id: int) -> None:
+        self.scan_status_message = (chat_id, message_id)
+
+    async def refresh_scan_status(self) -> None:
+        message = getattr(self, "scan_status_message", None)
+        if not message:
+            return
+        chat_id, message_id = message
+        text, markup = self.scan_progress_card()
+        try:
+            await self.edit_message(chat_id, message_id, text, markup)
+        except RuntimeError as exc:
+            if "message is not modified" not in str(exc).lower():
+                log.debug("scan status message cannot be updated: %s", exc)
+                self.scan_status_message = None
 
     def scan_progress_card(self) -> tuple[str, dict]:
         progress = getattr(self, "scan_progress", ScanProgress())
@@ -399,7 +475,7 @@ class TelegramBot:
             return
         self.last_error_notice = now
         try:
-            await self.send(settings.telegram_admin_id, f"🔴 {context}: {type(exc).__name__}: {str(exc)[:600]}")
+            await self.send_temporary(settings.telegram_admin_id, f"🔴 {context}: {type(exc).__name__}: {str(exc)[:600]}", ttl=20)
         except Exception:
             log.exception("could not notify admin about error")
 
@@ -646,6 +722,24 @@ class TelegramBot:
                 await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 log.warning("answerCallbackQuery failed (expired query?): %s", exc)
+
+        async def reply(text: str, markup: dict | None = None, fallback_chat_id: int | None = None) -> None:
+            message = callback.get("message") or {}
+            chat = message.get("chat") or {}
+            message_id = message.get("message_id")
+            chat_id = chat.get("id")
+            if chat_id and message_id:
+                if (callback.get("data") or "").startswith("scan:"):
+                    self.remember_scan_message(chat_id, message_id)
+                try:
+                    await self.edit_message(chat_id, message_id, text, markup)
+                    return
+                except RuntimeError as exc:
+                    if "message is not modified" in str(exc).lower():
+                        return
+                    log.debug("callback message cannot be edited: %s", exc)
+            await self.send(fallback_chat_id or chat_id or settings.telegram_admin_id, text, markup)
+
         sender_id = sender.get("id")
         data = (callback.get("data") or "").split(":")
         if len(data) == 3 and data[0] == "userignore" and data[1] == "t":
@@ -654,47 +748,46 @@ class TelegramBot:
             if not is_allowed(user):
                 return
             result = await asyncio.to_thread(self.toggle_user_ignored_category, sender_id, data[2])
-            await self.send(sender.get("id"), result or "Категория не найдена — откройте раздел заново.")
+            await reply(result or "Категория не найдена — откройте раздел заново.", fallback_chat_id=sender.get("id"))
             return
         if not is_admin(sender_id, settings.telegram_admin_id):
             return
         if data == ["menu", "main"]:
-            await self.send(settings.telegram_admin_id, "Главное меню готово. Выберите действие:")
+            await reply("Главное меню готово. Выберите действие:")
             return
         if len(data) == 3 and data[0] == "settings" and data[1] == "set":
             try:
                 self.set_schedule_mode(data[2])
             except ValueError:
-                await self.send(settings.telegram_admin_id, "Неизвестный режим расписания.")
+                await reply("Неизвестный режим расписания.")
                 return
-            await self.send(settings.telegram_admin_id, f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard(self.notifications_enabled()))
+            await reply(f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard(self.notifications_enabled()))
             return
         if data == ["settings", "notifications", "toggle"]:
             enabled = not self.notifications_enabled()
             self.set_notifications_enabled(enabled)
-            await self.send(
-                settings.telegram_admin_id,
+            await reply(
                 f"{'🔔 Уведомления включены' if enabled else '🔕 Уведомления выключены'}.",
                 settings_keyboard(enabled),
             )
             return
         if data == ["errors", "clear", "cancel"]:
-            await self.send(settings.telegram_admin_id, "Очистка журнала ошибок отменена.")
+            await reply("Очистка журнала ошибок отменена.")
             return
         if data == ["errors", "clear", "confirm"]:
             deleted = await asyncio.to_thread(self.clear_errors)
-            await self.send(settings.telegram_admin_id, f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
+            await reply(f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
             return
         if data == ["scan", "status"]:
             text, markup = self.scan_progress_card()
-            await self.send(settings.telegram_admin_id, text, markup)
+            await reply(text, markup)
             return
         if data == ["scan", "stop"]:
             if not self.scan_is_running():
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, text, markup)
+                await reply(text, markup)
                 return
-            await self.send(settings.telegram_admin_id, "Остановить текущую проверку? Уже обработанные документы сохранятся.", {
+            await reply("Остановить текущую проверку? Уже обработанные документы сохранятся.", {
                 "inline_keyboard": [[
                     {"text": "⏹ Да, остановить", "callback_data": "scan:stop:confirm"},
                     {"text": "Отмена", "callback_data": "scan:stop:cancel"},
@@ -703,37 +796,38 @@ class TelegramBot:
             return
         if data == ["scan", "stop", "cancel"]:
             text, markup = self.scan_progress_card()
-            await self.send(settings.telegram_admin_id, "Остановка отменена.\n\n" + text, markup)
+            await reply("Остановка отменена.\n\n" + text, markup)
             return
         if data == ["scan", "stop", "confirm"]:
             if self.stop_scan():
-                await self.send(settings.telegram_admin_id, "⏹ Остановка проверки запрошена.\n\n" + self.scan_progress_card()[0], self.scan_progress_card()[1])
+                text, markup = self.scan_progress_card()
+                await reply("⏹ Остановка проверки запрошена.\n\n" + text, markup)
             else:
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, "Проверка уже завершена.\n\n" + text, markup)
+                await reply("Проверка уже завершена.\n\n" + text, markup)
             return
         if data == ["scan", "retry"]:
             if self.start_scan("retry"):
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, text, markup)
+                await reply(text, markup)
             else:
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, "Повторный запуск не выполнен: проверка уже идёт.\n\n" + text, markup)
+                await reply("Повторный запуск не выполнен: проверка уже идёт.\n\n" + text, markup)
             return
         if data == ["scan", "run", "cancel"]:
-            await self.send(settings.telegram_admin_id, "Запуск проверки отменён.")
+            await reply("Запуск проверки отменён.")
             return
         if data == ["scan", "run", "confirm"]:
             if self.start_scan():
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, "Проверка запущена в фоне.\n\n" + text, markup)
+                await reply("Проверка запущена в фоне.\n\n" + text, markup)
             else:
                 text, markup = self.scan_progress_card()
-                await self.send(settings.telegram_admin_id, "Проверка уже выполняется.\n\n" + text, markup)
+                await reply("Проверка уже выполняется.\n\n" + text, markup)
             return
         if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
             result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
-            await self.send(settings.telegram_admin_id, result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
+            await reply(result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
             return
         if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
             return
@@ -742,14 +836,14 @@ class TelegramBot:
         with SessionLocal() as session:
             user = session.get(UserAccess, user_id)
             if not user:
-                await self.send(settings.telegram_admin_id, f"Пользователь {user_id} не найден.")
+                await reply(f"Пользователь {user_id} не найден.")
                 return
             user.status = status
             user.reviewed_at = datetime.now(UTC)
             session.commit()
             target_chat = user.chat_id
         await self.send(target_chat, "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.")
-        await self.send(settings.telegram_admin_id, f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.")
+        await reply(f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.")
 
     def _build_report(self, event_id: int) -> tuple[str, list[tuple[str, bytes, str]]] | None:
         store = ObjectStore()
@@ -861,7 +955,7 @@ class TelegramBot:
                 await self.send(chat_id, await asyncio.to_thread(self.settings_text), settings_keyboard(self.notifications_enabled()))
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
-            await self.send(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.")
+            await self.send_temporary(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.", ttl=15)
         finally:
             log.info("command %s took %.2fs", command, time.monotonic() - started_at)
 

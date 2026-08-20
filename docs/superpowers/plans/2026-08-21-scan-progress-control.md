@@ -68,3 +68,16 @@
 - [x] Запустить полный `pytest`, Ruff и compileall.
 - [x] Синхронизировать только исходники бота на `mxbox` без `--delete`, перезапустить service и проверить `systemctl`, journal, live catalog и smoke callbacks.
 - [x] Зафиксировать remote результат и оставить незакрытые сетевые ошибки в журнале.
+
+### Task 5: Telegram-native message lifecycle
+
+**Files:**
+- Modify: `src/fstec_monitor/telegram_bot.py`
+- Modify: `src/fstec_monitor/notify.py`
+- Test: `tests/test_telegram_bot.py`
+
+- [x] Проверить актуальные Bot API методы `editMessageText`, `deleteMessage` и `link_preview_options`.
+- [x] Добавить редактирование исходного callback-сообщения вместо отправки нового.
+- [x] Добавить throttled обновление сохранённой scan-карточки и автоудаление временных сообщений.
+- [x] Заменить deprecated `disable_web_page_preview` на `link_preview_options`.
+- [x] Запустить полный suite и remote smoke.

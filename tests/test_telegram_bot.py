@@ -34,6 +34,106 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_edit_and_delete_message_use_telegram_native_methods():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return True
+
+    bot.call = call
+    asyncio.run(bot.edit_message(123, 45, "Обновлено", {"inline_keyboard": []}))
+    asyncio.run(bot.delete_message(123, 45))
+
+    assert calls == [
+        ("editMessageText", {
+            "chat_id": 123,
+            "message_id": 45,
+            "text": "Обновлено",
+            "link_preview_options": {"is_disabled": True},
+            "reply_markup": {"inline_keyboard": []},
+        }),
+        ("deleteMessage", {"chat_id": 123, "message_id": 45}),
+    ]
+
+
+def test_callback_edits_origin_message_instead_of_sending_another():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    edited = []
+    sent = []
+
+    async def call(method, payload):
+        if method == "answerCallbackQuery":
+            return True
+        edited.append((method, payload))
+        return True
+
+    async def send(*args, **kwargs):
+        sent.append((args, kwargs))
+
+    bot.call = call
+    bot.send = send
+    bot.set_schedule_mode = lambda _mode: None
+    bot.notifications_enabled = lambda: True
+    asyncio.run(bot.handle_callback({
+        "id": "callback-1",
+        "from": {"id": 151599744},
+        "message": {"message_id": 88, "chat": {"id": 151599744}},
+        "data": "settings:set:disabled",
+    }))
+
+    assert sent == []
+    assert edited[0][0] == "editMessageText"
+    assert edited[0][1]["chat_id"] == 151599744
+    assert edited[0][1]["message_id"] == 88
+
+
+def test_scan_progress_refresh_edits_one_saved_message():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_status_message = (123, 77)
+    bot.scan_progress = ScanProgress(state="running", stage="Документы", completed=3, total=10)
+    edited = []
+
+    async def edit_message(*args):
+        edited.append(args)
+
+    bot.edit_message = edit_message
+    asyncio.run(bot.refresh_scan_status())
+
+    assert len(edited) == 1
+    assert edited[0][:2] == (123, 77)
+    assert "3/10" in edited[0][2]
+
+
+def test_temporary_message_is_deleted_after_ttl():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return {"message_id": 77} if method == "sendMessage" else True
+
+    bot.call = call
+    async def run():
+        await bot.send_temporary(123, "Временное сообщение", ttl=0.01)
+        await asyncio.sleep(0.02)
+
+    asyncio.run(run())
+
+    assert calls[0][0] == "sendMessage"
+    assert "reply_markup" not in calls[0][1]
+    assert calls[1] == ("deleteMessage", {"chat_id": 123, "message_id": 77})
+
+
 def test_only_configured_admin_is_authorized():
     assert is_admin(151599744, 151599744)
     assert not is_admin(151599745, 151599744)

@@ -182,7 +182,7 @@ async def notify_pending(session) -> int:
                             "chat_id": chat_id,
                             "text": message,
                             "parse_mode": "HTML",
-                            "disable_web_page_preview": True,
+                            "link_preview_options": {"is_disabled": True},
                         },
                     )
                     r.raise_for_status()
