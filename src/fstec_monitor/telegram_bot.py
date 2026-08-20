@@ -451,14 +451,18 @@ class TelegramBot:
 
     async def report_error(self, context: str, exc: Exception, *, notify_admin: bool = True) -> None:
         now = time.monotonic()
-        log.warning("%s (%s): %s", context, type(exc).__name__, str(exc)[:300])
+        log.warning("%s (%s)", context, type(exc).__name__)
         if not notify_admin:
             return
         if now - self.last_error_notice < 60:
             return
         self.last_error_notice = now
         try:
-            await self.send_temporary(settings.telegram_admin_id, f"🔴 {context}: {type(exc).__name__}: {str(exc)[:600]}", ttl=20)
+            await self.send_temporary(
+                settings.telegram_admin_id,
+                f"⚠️ Ошибка в операции: {context}. Подробности записаны в журнал.",
+                ttl=20,
+            )
         except Exception:
             log.exception("could not notify admin about error")
 
