@@ -7,7 +7,8 @@ import httpx
 from sqlalchemy import select
 
 from .config import settings
-from .models import Document, Event
+from .crawler import category_key
+from .models import BotSetting, Document, Event, EventDelivery, UserAccess, UserIgnoredCategory
 from .telegram_bot import api_url
 
 log = logging.getLogger(__name__)
@@ -85,84 +86,122 @@ def split_new_errors(events: list[Event], previously_notified: list[Event]) -> t
     return unique, duplicates
 
 async def notify_pending(session) -> int:
-    if not settings.telegram_bot_token or not settings.telegram_chat_id: return 0
-    events=session.scalars(select(Event).where(Event.notified.is_(False)).order_by(Event.id)).all()
+    if not settings.telegram_bot_token:
+        return 0
+    setting = session.get(BotSetting, "notifications_enabled")
+    if setting and setting.value == "0":
+        return 0
+
+    events = session.scalars(select(Event).where(Event.notified.is_(False)).order_by(Event.id)).all()
+    recipients = {settings.telegram_admin_id}
+    if settings.telegram_chat_id:
+        try:
+            recipients.add(int(settings.telegram_chat_id))
+        except ValueError:
+            log.warning("invalid FSTEC_TELEGRAM_CHAT_ID; skipping configured chat")
+    recipients.update(
+        user.chat_id
+        for user in session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
+    )
+    recipients.discard(None)
+    if not recipients:
+        return 0
+
+    error_events = [event for event in events if event.kind in ERROR_KINDS]
+    notified_errors = session.scalars(
+        select(Event).where(Event.kind.in_(ERROR_KINDS), Event.notified.is_(True))
+    ).all()
+    error_events, duplicate_errors = split_new_errors(error_events, notified_errors)
+    for event in duplicate_errors:
+        event.notified = True
+
+    other_events = [event for event in events if event.kind not in ERROR_KINDS]
+    meaningful_events = [event for event in other_events if should_notify_event(event)]
+    for event in other_events:
+        if not should_notify_event(event):
+            event.notified = True
+    seen: set[tuple[str, int | None, str, str]] = set()
+    unique_events: list[Event] = []
+    for event in meaningful_events:
+        fingerprint = (event.kind, event.document_id, event.summary, event.details)
+        if fingerprint in seen:
+            event.notified = True
+            continue
+        seen.add(fingerprint)
+        unique_events.append(event)
+    session.commit()
+
+    candidate_events = error_events + unique_events
+    if not candidate_events:
+        return 0
+    documents = {
+        document.id: document
+        for document in session.scalars(
+            select(Document).where(Document.id.in_({event.document_id for event in candidate_events if event.document_id}))
+        ).all()
+    }
+    approved_users = session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
+    user_by_chat = {user.chat_id: user.user_id for user in approved_users}
+    ignored_by_user: dict[int, set[str]] = {}
+    if user_by_chat:
+        ignored_rows = session.scalars(
+            select(UserIgnoredCategory).where(UserIgnoredCategory.user_id.in_(set(user_by_chat.values())))
+        ).all()
+        for row in ignored_rows:
+            ignored_by_user.setdefault(row.user_id, set()).add(row.category_key)
     sent = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-        error_events = [event for event in events if event.kind in ERROR_KINDS]
-        notified_errors = session.scalars(
-            select(Event).where(Event.kind.in_(ERROR_KINDS), Event.notified.is_(True))
-        ).all()
-        error_events, duplicate_errors = split_new_errors(error_events, notified_errors)
-        for event in duplicate_errors:
-            event.notified = True
-        if duplicate_errors:
-            session.commit()
-        if error_events:
-            try:
-                r = await client.post(
-                    api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
-                    json={
-                        "chat_id": settings.telegram_chat_id,
-                        "text": format_error_digest(error_events),
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
-                r.raise_for_status()
-                body = r.json()
-                if not body.get("ok"):
-                    raise RuntimeError(body.get("description", "Telegram API rejected error digest"))
-            except (httpx.HTTPError, RuntimeError) as exc:
-                log.warning("error digest failed: %s", exc)
-            else:
-                for event in error_events:
-                    event.notified = True
+        for chat_id in sorted(recipients):
+            delivered = set(session.scalars(
+                select(EventDelivery.event_id).where(EventDelivery.chat_id == chat_id)
+            ).all())
+            ignored = ignored_by_user.get(user_by_chat.get(chat_id), set())
+            def visible(event: Event, ignored: set[str] = ignored) -> bool:
+                document = documents.get(event.document_id) if event.document_id else None
+                return not ignored or not document or category_key(document.category) not in ignored
+            hidden_events = [event for event in candidate_events if event.id not in delivered and not visible(event)]
+            for event in hidden_events:
+                session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
+            if hidden_events:
+                session.commit()
+            pending_errors = [event for event in error_events if event.id not in delivered and visible(event)]
+            pending_changes = [event for event in unique_events if event.id not in delivered and visible(event)]
+            messages = (
+                (format_error_digest(pending_errors), pending_errors),
+                (format_change_digest(pending_changes, documents), pending_changes),
+            )
+            for message, message_events in messages:
+                if not message_events:
+                    continue
+                if not message:
+                    continue
+                try:
+                    r = await client.post(
+                        api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
+                        json={
+                            "chat_id": chat_id,
+                            "text": message,
+                            "parse_mode": "HTML",
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    r.raise_for_status()
+                    body = r.json()
+                    if not body.get("ok"):
+                        raise RuntimeError(body.get("description", "Telegram API rejected notification"))
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    log.warning("notification digest failed chat=%s: %s", chat_id, exc)
+                    continue
+                for event in message_events:
+                    session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
                 session.commit()
                 sent += 1
 
-        other_events = [event for event in events if event.kind not in ERROR_KINDS]
-        meaningful_events = [event for event in other_events if should_notify_event(event)]
-        for event in other_events:
-            if not should_notify_event(event):
-                event.notified = True
-        seen: set[tuple[str, int | None, str, str]] = set()
-        unique_events: list[Event] = []
-        for event in meaningful_events:
-            fingerprint = (event.kind, event.document_id, event.summary, event.details)
-            if fingerprint in seen:
-                event.notified = True
-                continue
-            seen.add(fingerprint)
-            unique_events.append(event)
-        if other_events:
-            session.commit()
-        if unique_events:
-            documents = {
-                document.id: document
-                for document in session.scalars(
-                    select(Document).where(Document.id.in_({event.document_id for event in unique_events if event.document_id}))
-                ).all()
-            }
-            try:
-                r = await client.post(
-                    api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
-                    json={
-                        "chat_id": settings.telegram_chat_id,
-                        "text": format_change_digest(unique_events, documents),
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                )
-                r.raise_for_status()
-                body = r.json()
-                if not body.get("ok"):
-                    raise RuntimeError(body.get("description", "Telegram API rejected notification digest"))
-            except (httpx.HTTPError, RuntimeError) as exc:
-                log.warning("notification digest failed: %s", exc)
-            else:
-                for event in unique_events:
-                    event.notified = True
-                session.commit()
-                sent += 1
+    for event in candidate_events:
+        if all(
+            session.scalar(select(EventDelivery.id).where(EventDelivery.event_id == event.id, EventDelivery.chat_id == chat_id))
+            for chat_id in recipients
+        ):
+            event.notified = True
+    session.commit()
     return sent

@@ -23,6 +23,7 @@ from fstec_monitor.telegram_bot import (
     is_admin,
     settings_keyboard,
     telegram_commands,
+    user_keyboard,
 )
 
 
@@ -40,23 +41,40 @@ def test_only_configured_admin_is_authorized():
 def test_admin_menu_contains_only_expected_commands():
     commands = telegram_commands()
     assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "clear_errors", "scan", "users", "ignore", "settings", "help"]
-    assert admin_keyboard()["keyboard"][0] == [{"text": "/status"}, {"text": "/changes"}]
+    assert admin_keyboard()["keyboard"][0] == [{"text": "📊 Статус"}, {"text": "📰 Изменения"}]
     assert admin_keyboard()["is_persistent"] is True
 
 
 def test_admin_menu_exposes_settings_and_manual_scan():
     labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
 
-    assert "/settings" in labels
-    assert "/scan" in labels
+    assert "⚙️ Настройки" in labels
+    assert "🔍 Проверить сейчас" in labels
+    assert all(not label.startswith("/") for label in labels)
+
+
+def test_user_menu_contains_only_read_only_actions():
+    labels = [button["text"] for row in user_keyboard()["keyboard"] for button in row]
+
+    assert labels == ["📰 Последние изменения", "🚫 Мои категории", "ℹ️ Помощь"]
+    assert all(not label.startswith("/") for label in labels)
+
+
+def test_non_admin_command_whitelist_excludes_operations():
+    from fstec_monitor.telegram_bot import is_user_command_allowed
+
+    assert is_user_command_allowed("/changes")
+    assert is_user_command_allowed("/my_ignore")
+    assert not is_user_command_allowed("/scan")
+    assert not is_user_command_allowed("/errors")
+    assert not is_user_command_allowed("/settings")
 
 
 def test_admin_reply_keyboard_uses_the_same_command_labels_as_command_menu():
-    command_labels = {f"/{item['command']}" for item in telegram_commands()}
     labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
 
     assert len(labels) == len(set(labels))
-    assert set(labels) <= command_labels
+    assert set(labels) == set(telegram_bot_module.ADMIN_LABEL_COMMANDS)
 
 
 def test_settings_keyboard_contains_all_schedule_modes():
@@ -115,6 +133,7 @@ def test_schedule_mode_is_persisted(monkeypatch):
 def test_settings_callback_changes_mode_and_confirms(monkeypatch):
     bot = TelegramBot.__new__(TelegramBot)
     bot.set_schedule_mode = lambda mode: setattr(bot, "selected_mode", mode)
+    bot.notifications_enabled = lambda: True
     sent = []
     async def send(*args):
         sent.append(args)
@@ -381,6 +400,24 @@ def test_ignore_toggle_persists_category(tmp_db):
     assert "снова отслеживается" in bot.toggle_ignored_category(token)
     assert bot.ignored_categories_db() == []
     assert bot.toggle_ignored_category("0" * 16) is None
+
+
+def test_user_ignore_toggle_is_private_to_that_user(tmp_db):
+    with tmp_db() as session:
+        session.add_all([
+            Document(canonical_url="https://example.test/1", category="Приказы"),
+            Document(canonical_url="https://example.test/2", category="Письма"),
+        ])
+        session.commit()
+    bot = TelegramBot.__new__(TelegramBot)
+
+    token = category_token("Приказы")
+    assert "скрыта из ваших уведомлений" in bot.toggle_user_ignored_category(42, token)
+    assert bot.user_ignored_categories(42) == ["Приказы"]
+    assert bot.user_ignored_categories(43) == []
+    text, markup = bot.user_ignore_text(42)
+    assert "Приказы" in text
+    assert any(f"userignore:t:{token}" == button["callback_data"] for row in markup["inline_keyboard"] for button in row)
 
 
 def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):

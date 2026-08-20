@@ -103,6 +103,24 @@ class UserAccess(Base):
     notification_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class UserIgnoredCategory(Base):
+    __tablename__ = "user_ignored_categories"
+    __table_args__ = (UniqueConstraint("user_id", "category_key", name="uq_user_ignored_category"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    category_key: Mapped[str] = mapped_column(String(255))
+    category_name: Mapped[str] = mapped_column(Text)
+
+
+class EventDelivery(Base):
+    __tablename__ = "event_deliveries"
+    __table_args__ = (UniqueConstraint("event_id", "chat_id", name="uq_event_delivery_chat"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ScanRun(Base):
     __tablename__ = "scan_runs"
     id: Mapped[int] = mapped_column(primary_key=True)

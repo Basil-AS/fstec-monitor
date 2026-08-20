@@ -4,7 +4,7 @@
 
 **Goal:** Дать администратору расширенное красивое меню, обычным пользователям — только чтение/уведомления, и доставлять события каждому одобренному чату.
 
-**Architecture:** Reply UI строится из двух наборов текстовых действий и переводит labels в существующие slash-команды. Права остаются серверной проверкой в `handle` и `handle_callback`. Доставка отделяется от общего флага `Event.notified` таблицей `EventDelivery`.
+**Architecture:** Reply UI строится из двух наборов текстовых действий и переводит labels в существующие slash-команды. Права остаются серверной проверкой в `handle` и `handle_callback`. Доставка отделяется от общего флага `Event.notified` таблицей `EventDelivery`, а персональные категории — таблицей `UserIgnoredCategory`.
 
 **Tech Stack:** Python 3.11+, asyncio, SQLAlchemy, SQLite/PostgreSQL, pytest.
 
@@ -17,31 +17,31 @@
 
 ---
 
-### Task 1: Текстовые меню и permissions
+### Task 1: Текстовые меню, permissions и персональный ignore
 
-**Files:** `src/fstec_monitor/telegram_bot.py`, `tests/test_telegram_bot.py`
+**Files:** `src/fstec_monitor/telegram_bot.py`, `src/fstec_monitor/models.py`, `src/fstec_monitor/db.py`, `tests/test_telegram_bot.py`
 
-- [ ] Написать failing-тесты на красивые уникальные labels, user keyboard, mapping labels и запрет admin-команд обычному пользователю.
-- [ ] Запустить focused tests и увидеть RED.
-- [ ] Добавить `user_keyboard`, label mappings, расширенное admin menu и whitelist пользовательских команд; подключить уведомление toggle в settings.
-- [ ] Запустить focused tests и получить GREEN.
-- [ ] Commit `feat(bot): add role-specific Telegram menus`.
+- [x] Написать failing-тесты на красивые уникальные labels, user keyboard, mapping labels и запрет admin-команд обычному пользователю.
+- [x] Запустить focused tests и увидеть RED.
+- [x] Добавить `user_keyboard`, label mappings, расширенное admin menu и whitelist пользовательских команд; подключить персональный список категорий пользователя и notification toggle в settings.
+- [x] Запустить focused tests и получить GREEN.
+- [x] Commit `feat(bot): add role-specific Telegram menus`.
 
 ### Task 2: Персональная доставка событий
 
 **Files:** `src/fstec_monitor/models.py`, `src/fstec_monitor/db.py`, `src/fstec_monitor/notify.py`, `tests/test_notify.py`
 
-- [ ] Написать failing-тест на доставку одного события администратору и двум approved чатам с независимыми delivery records.
-- [ ] Запустить focused test и увидеть RED.
-- [ ] Добавить `EventDelivery`, SQLite migration и fan-out сводок по получателям; `Event.notified` выставлять только после доставки всем текущим получателям.
-- [ ] Запустить focused tests и получить GREEN.
-- [ ] Commit `feat(notify): fan out updates to approved users`.
+- [x] Написать failing-тест на доставку одного события администратору и двум approved чатам с независимыми delivery records.
+- [x] Запустить focused test и увидеть RED.
+- [x] Добавить `EventDelivery`, SQLite migration и fan-out сводок по получателям; `Event.notified` выставлять только после доставки всем текущим получателям.
+- [x] Запустить focused tests и получить GREEN.
+- [x] Commit `feat(notify): fan out updates to approved users`.
 
 ### Task 3: Проверка и remote rollout
 
 **Files:** `README.md`, `tests/test_deployment_config.py`
 
-- [ ] Обновить документацию по ролям и кнопкам.
-- [ ] Запустить полный local suite, Ruff и compileall.
+- [x] Обновить документацию по ролям и кнопкам.
+- [x] Запустить полный local suite, Ruff и compileall.
 - [ ] Синхронизировать изменённые файлы на `mxbox`, перезапустить `fstec-monitor.service`, проверить unit, journal, БД и безопасный smoke-test UI.
 - [ ] Зафиксировать результаты и оставшиеся внешние сетевые блокеры без отключения TLS.

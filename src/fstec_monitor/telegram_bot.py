@@ -23,6 +23,7 @@ from .models import (
     ScanRun,
     Snapshot,
     UserAccess,
+    UserIgnoredCategory,
 )
 from .normalize import normalize_space
 from .reports import event_report_md, safe_filename
@@ -64,6 +65,22 @@ ADMIN_COMMANDS = (
     ("settings", "настройки расписания"),
     ("help", "справка по командам"),
 )
+ADMIN_LABEL_COMMANDS = {
+    "📊 Статус": "/status",
+    "📰 Изменения": "/changes",
+    "🔍 Проверить сейчас": "/scan",
+    "🧯 Ошибки": "/errors",
+    "👥 Пользователи": "/users",
+    "🚫 Игнор категорий": "/ignore",
+    "⚙️ Настройки": "/settings",
+    "ℹ️ Помощь": "/help",
+}
+USER_LABEL_COMMANDS = {
+    "📰 Последние изменения": "/changes",
+    "🚫 Мои категории": "/my_ignore",
+    "ℹ️ Помощь": "/help",
+}
+USER_ALLOWED_COMMANDS = {"/start", "/help", "/changes", "/my_ignore"}
 
 
 def api_url(api_root: str, token: str, method: str) -> str:
@@ -81,24 +98,41 @@ def telegram_commands() -> list[dict[str, str]]:
 def admin_keyboard() -> dict:
     return {
         "keyboard": [
-            [{"text": "/status"}, {"text": "/changes"}],
-            [{"text": "/scan"}, {"text": "/errors"}],
-            [{"text": "/users"}, {"text": "/ignore"}],
-            [{"text": "/settings"}, {"text": "/help"}],
+            [{"text": "📊 Статус"}, {"text": "📰 Изменения"}],
+            [{"text": "🔍 Проверить сейчас"}, {"text": "🧯 Ошибки"}],
+            [{"text": "👥 Пользователи"}, {"text": "🚫 Игнор категорий"}],
+            [{"text": "⚙️ Настройки"}, {"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
-        "input_field_placeholder": "Выберите действие или введите /report ID",
+        "input_field_placeholder": "Выберите действие или введите команду",
     }
 
 
-def settings_keyboard() -> dict:
+def user_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "📰 Последние изменения"}, {"text": "🚫 Мои категории"}],
+            [{"text": "ℹ️ Помощь"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "Выберите действие",
+    }
+
+
+def is_user_command_allowed(command: str) -> bool:
+    return command.split("@", 1)[0].lower() in USER_ALLOWED_COMMANDS
+
+
+def settings_keyboard(notifications_enabled: bool = True) -> dict:
     return {
         "inline_keyboard": [
             [{"text": "✅ Раз в сутки · 12:00", "callback_data": f"settings:set:{DAILY_NOON}"}],
             [{"text": "Раз в сутки · 00:00", "callback_data": f"settings:set:{DAILY_MIDNIGHT}"}],
             [{"text": "Каждые 2 часа", "callback_data": f"settings:set:{EVERY_TWO_HOURS}"}],
             [{"text": "⏸ Выключить автозапуск", "callback_data": f"settings:set:{DISABLED}"}],
+            [{"text": f"{'🔔' if notifications_enabled else '🔕'} Уведомления: {'включены' if notifications_enabled else 'выключены'}", "callback_data": "settings:notifications:toggle"}],
             [{"text": "↩️ Главное меню", "callback_data": "menu:main"}],
         ]
     }
@@ -155,10 +189,12 @@ class TelegramBot:
     async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> None:
         for start in range(0, len(text), 3900):
             payload = {"chat_id": chat_id, "text": text[start:start + 3900], "disable_web_page_preview": True}
-            if chat_id == settings.telegram_admin_id:
-                payload["reply_markup"] = admin_keyboard()
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
+            elif chat_id == settings.telegram_admin_id:
+                payload["reply_markup"] = admin_keyboard()
+            else:
+                payload["reply_markup"] = user_keyboard()
             await self.call("sendMessage", payload)
 
     async def configure_menu(self) -> None:
@@ -228,6 +264,21 @@ class TelegramBot:
                 setting.value = mode
             session.commit()
         self.next_scan_at = next_scheduled_at(mode, datetime.now().astimezone())
+
+    def notifications_enabled(self) -> bool:
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, "notifications_enabled")
+        return setting is None or setting.value != "0"
+
+    def set_notifications_enabled(self, enabled: bool) -> None:
+        init_db()
+        with SessionLocal() as session:
+            setting = session.get(BotSetting, "notifications_enabled")
+            if setting is None:
+                session.add(BotSetting(key="notifications_enabled", value="1" if enabled else "0"))
+            else:
+                setting.value = "1" if enabled else "0"
+            session.commit()
 
     def settings_text(self) -> str:
         mode = self.get_schedule_mode()
@@ -351,6 +402,52 @@ class TelegramBot:
             value = setting.value if setting else ""
         return [line.strip() for line in value.splitlines() if line.strip()]
 
+    def user_ignored_categories(self, user_id: int) -> list[str]:
+        with SessionLocal() as session:
+            return [
+                item.category_name
+                for item in session.scalars(
+                    select(UserIgnoredCategory).where(UserIgnoredCategory.user_id == user_id).order_by(UserIgnoredCategory.category_name)
+                ).all()
+            ]
+
+    def toggle_user_ignored_category(self, user_id: int, token: str) -> str | None:
+        with SessionLocal() as session:
+            known = [c for c in session.scalars(select(Document.category).distinct()).all() if c]
+            target = next((c for c in sorted(known) if category_token(c) == token), None)
+            if target is None:
+                return None
+            key = category_key(target)
+            existing = session.scalar(
+                select(UserIgnoredCategory).where(
+                    UserIgnoredCategory.user_id == user_id,
+                    UserIgnoredCategory.category_key == key,
+                )
+            )
+            if existing:
+                session.delete(existing)
+                session.commit()
+                return f"✅ Категория снова включена: {target}"
+            session.add(UserIgnoredCategory(user_id=user_id, category_key=key, category_name=target))
+            session.commit()
+            return f"🚫 Категория скрыта из ваших уведомлений: {target}"
+
+    def user_ignore_text(self, user_id: int) -> tuple[str, dict | None]:
+        ignored = self.user_ignored_categories(user_id)
+        ignored_keys = {category_key(c) for c in ignored}
+        with SessionLocal() as session:
+            known = sorted(c for c in session.scalars(select(Document.category).distinct()).all() if c)
+        lines = ["🚫 Мои категории", "Выберите категории, по которым не получать уведомления:"]
+        lines.append("Скрыты: " + ", ".join(ignored) if ignored else "Скрытых категорий нет")
+        buttons = []
+        for category in known[:30]:
+            hidden = category_key(category) in ignored_keys
+            buttons.append([{
+                "text": f"{'✅' if hidden else '👁️'} {category[:40]}",
+                "callback_data": f"userignore:t:{category_token(category)}",
+            }])
+        return "\n".join(lines), {"inline_keyboard": buttons} if buttons else None
+
     def set_ignored_categories_db(self, categories: list[str]) -> None:
         init_db()
         with SessionLocal() as session:
@@ -467,9 +564,18 @@ class TelegramBot:
                 await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 log.warning("answerCallbackQuery failed (expired query?): %s", exc)
-        if not is_admin(sender.get("id"), settings.telegram_admin_id):
-            return
+        sender_id = sender.get("id")
         data = (callback.get("data") or "").split(":")
+        if len(data) == 3 and data[0] == "userignore" and data[1] == "t":
+            with SessionLocal() as session:
+                user = session.get(UserAccess, sender_id) if sender_id else None
+            if not is_allowed(user):
+                return
+            result = await asyncio.to_thread(self.toggle_user_ignored_category, sender_id, data[2])
+            await self.send(sender.get("id"), result or "Категория не найдена — откройте раздел заново.")
+            return
+        if not is_admin(sender_id, settings.telegram_admin_id):
+            return
         if data == ["menu", "main"]:
             await self.send(settings.telegram_admin_id, "Главное меню готово. Выберите действие:")
             return
@@ -479,7 +585,16 @@ class TelegramBot:
             except ValueError:
                 await self.send(settings.telegram_admin_id, "Неизвестный режим расписания.")
                 return
-            await self.send(settings.telegram_admin_id, f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard())
+            await self.send(settings.telegram_admin_id, f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard(self.notifications_enabled()))
+            return
+        if data == ["settings", "notifications", "toggle"]:
+            enabled = not self.notifications_enabled()
+            self.set_notifications_enabled(enabled)
+            await self.send(
+                settings.telegram_admin_id,
+                f"{'🔔 Уведомления включены' if enabled else '🔕 Уведомления выключены'}.",
+                settings_keyboard(enabled),
+            )
             return
         if data == ["errors", "clear", "cancel"]:
             await self.send(settings.telegram_admin_id, "Очистка журнала ошибок отменена.")
@@ -570,13 +685,18 @@ class TelegramBot:
                 and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
             return
         parts = text.split()
+        text = {**ADMIN_LABEL_COMMANDS, **USER_LABEL_COMMANDS}.get(text, text)
+        parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
-            if command in {"/scan", "/users", "/ignore", "/settings", "/clear_errors"} and not is_admin(sender_id, settings.telegram_admin_id):
-                await self.send(chat_id, "Эта команда доступна только администратору.")
+            if not is_admin(sender_id, settings.telegram_admin_id) and not is_user_command_allowed(command):
+                await self.send(chat_id, "Доступно только получение обновлений и настройка личных категорий.")
                 return
             if command in {"/start", "/help"}:
-                await self.send(chat_id, "Меню готово.\n\n/status — статистика, квота и расписание\n/changes [N] — последние изменения\n/report ID — отчёт и diff_<ID>.md с версиями\n/diff ID — то же самое\n/errors — ошибки\n/clear_errors — очистить журнал ошибок\n/ignore — управление игнором категорий\n/scan — проверить сейчас\n/settings — настроить расписание")
+                if is_admin(sender_id, settings.telegram_admin_id):
+                    await self.send(chat_id, "Меню администратора готово.\n\n📊 Статус — статистика, квота и расписание\n📰 Изменения — последние изменения\n🔍 Проверить сейчас — ручной запуск\n🧯 Ошибки — журнал ошибок\n👥 Пользователи — заявки на доступ\n🚫 Игнор категорий — глобальный ignore\n⚙️ Настройки — расписание и уведомления\n/report ID — подробный отчёт")
+                else:
+                    await self.send(chat_id, "Меню готово.\n\n📰 Последние изменения — сводка событий\n🚫 Мои категории — персональный список скрытых категорий\nℹ️ Вы получаете только уведомления об интересующих изменениях.")
             elif command == "/status":
                 await self.send(chat_id, await self.status_text())
             elif command in {"/changes", "/events"}:
@@ -599,6 +719,9 @@ class TelegramBot:
             elif command == "/ignore":
                 text_out, markup = await asyncio.to_thread(self.ignore_text)
                 await self.send(chat_id, text_out, markup)
+            elif command == "/my_ignore":
+                text_out, markup = await asyncio.to_thread(self.user_ignore_text, sender_id)
+                await self.send(chat_id, text_out, markup)
             elif command == "/scan":
                 if self.scan_is_running():
                     await self.send(chat_id, "Проверка уже выполняется.")
@@ -610,7 +733,7 @@ class TelegramBot:
                         ]]
                     })
             elif command == "/settings":
-                await self.send(chat_id, await asyncio.to_thread(self.settings_text), settings_keyboard())
+                await self.send(chat_id, await asyncio.to_thread(self.settings_text), settings_keyboard(self.notifications_enabled()))
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
             await self.send(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.")
