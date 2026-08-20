@@ -38,6 +38,7 @@ from .schedule import (
     schedule_label,
 )
 from .storage import ObjectStore
+from .telegram import keyboards as telegram_keyboards
 
 log = logging.getLogger(__name__)
 MEANINGFUL_KINDS = {
@@ -114,29 +115,11 @@ def telegram_commands() -> list[dict[str, str]]:
 
 
 def admin_keyboard() -> dict:
-    return {
-        "keyboard": [
-            [{"text": "📊 Статус"}, {"text": "📰 Изменения"}],
-            [{"text": "🔍 Проверить сейчас"}, {"text": "🧯 Ошибки"}],
-            [{"text": "👥 Пользователи"}, {"text": "🚫 Игнор категорий"}],
-            [{"text": "⚙️ Настройки"}, {"text": "ℹ️ Помощь"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-        "input_field_placeholder": "Выберите действие или введите команду",
-    }
+    return telegram_keyboards.admin_keyboard()
 
 
 def user_keyboard() -> dict:
-    return {
-        "keyboard": [
-            [{"text": "📰 Последние изменения"}, {"text": "🚫 Мои категории"}],
-            [{"text": "ℹ️ Помощь"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-        "input_field_placeholder": "Выберите действие",
-    }
+    return telegram_keyboards.user_keyboard()
 
 
 def is_user_command_allowed(command: str) -> bool:
