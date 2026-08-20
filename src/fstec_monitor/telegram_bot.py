@@ -14,7 +14,16 @@ from sqlalchemy import delete, func, select
 from .access import access_request_text, is_allowed
 from .config import settings
 from .db import SessionLocal, init_db
-from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, Snapshot, UserAccess
+from .models import (
+    Attachment,
+    AttachmentVersion,
+    BotSetting,
+    Document,
+    Event,
+    ScanRun,
+    Snapshot,
+    UserAccess,
+)
 from .normalize import normalize_space
 from .reports import event_report_md, safe_filename
 from .schedule import (
@@ -92,6 +101,17 @@ def _dt(value) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M") if value else "нет данных"
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} с"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} мин {sec:02d} с"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes:02d} мин"
+
+
 def category_key(value: str) -> str:
     return normalize_space(value).casefold()
 
@@ -159,19 +179,20 @@ class TelegramBot:
         if not body.get("ok"):
             raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
 
-    async def scan(self, baseline: bool = False) -> int:
+    async def scan(self, baseline: bool = False, trigger: str = "manual") -> int:
         async with self.scan_lock:
             from .crawler import run_monitor
-            count = await run_monitor(baseline=baseline)
+            count = await run_monitor(baseline=baseline, trigger=trigger)
             with SessionLocal() as session:
                 from .notify import notify_pending
                 await notify_pending(session)
             return count
 
-    async def _scan_task(self) -> int:
+    async def _scan_task(self, trigger: str = "manual") -> int:
+        started = time.monotonic()
         try:
-            count = await self.scan()
-            await self.send(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. /status")
+            count = await self.scan(trigger=trigger)
+            await self.send(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. Длительность: {_fmt_duration(time.monotonic() - started)}. /status")
             return count
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             log.exception("background scan failed")
@@ -212,10 +233,10 @@ class TelegramBot:
                 f"Текущее состояние: {state}\n\n"
                 "Выберите новый режим:")
 
-    def start_scan(self) -> bool:
+    def start_scan(self, trigger: str = "manual") -> bool:
         if self.scan_is_running():
             return False
-        self.scan_task = asyncio.create_task(self._scan_task())
+        self.scan_task = asyncio.create_task(self._scan_task(trigger))
         return True
 
     async def report_error(self, context: str, exc: Exception) -> None:
@@ -242,7 +263,7 @@ class TelegramBot:
         used, quota = await self.quota_status()
         mode = self.get_schedule_mode()
         next_run = next_scheduled_at(mode, datetime.now().astimezone())
-        return ("ФСТЭК Monitor\n"
+        text = ("ФСТЭК Monitor\n"
                 f"Документы: {stats['documents']}\nВложения: {stats['attachments']}\n"
                 f"Последняя проверка: {_dt(stats['last_scan'])}\nПоследнее изменение: {_dt(stats['last_change'])}\n"
                 f"Статус изменений: {'есть новые' if stats['pending'] else 'изменений нет'}\n"
@@ -250,9 +271,26 @@ class TelegramBot:
                 f"Расписание: {schedule_label(mode)}\n"
                 f"Следующая проверка: {_dt(next_run) if next_run else 'выключен'}\n"
                 f"Состояние: {'проверка выполняется' if self.scan_is_running() else 'ожидание'}")
+        if stats["last_duration"] is not None:
+            text += f"\nДлительность последней проверки: {_fmt_duration(stats['last_duration'])}"
+        if stats["avg_duration"] is not None:
+            text += f"\nСредняя длительность ({stats['runs_count']} зап.): {_fmt_duration(stats['avg_duration'])}"
+        return text
 
     def _status_stats(self) -> dict:
         with SessionLocal() as session:
+            runs = session.scalars(
+                select(ScanRun).where(ScanRun.finished_at.is_not(None)).order_by(ScanRun.id.desc()).limit(7)
+            ).all()
+            durations = []
+            for run in runs:
+                started, finished = run.started_at, run.finished_at
+                if started and started.tzinfo is None:
+                    started = started.replace(tzinfo=UTC)
+                if finished and finished.tzinfo is None:
+                    finished = finished.replace(tzinfo=UTC)
+                if started and finished:
+                    durations.append((finished - started).total_seconds())
             return {
                 "documents": session.scalar(select(func.count(Document.id)).where(Document.active.is_(True))) or 0,
                 "attachments": session.scalar(select(func.count(Attachment.id)).where(Attachment.active.is_(True))) or 0,
@@ -260,6 +298,9 @@ class TelegramBot:
                 "last_scan": session.scalar(select(func.max(Snapshot.fetched_at))),
                 "last_change": session.scalar(select(func.max(Event.created_at)).where(Event.kind.in_(MEANINGFUL_KINDS))),
                 "errors": session.scalar(select(func.count(Event.id)).where(Event.kind.in_(ERROR_KINDS))) or 0,
+                "last_duration": durations[0] if durations else None,
+                "avg_duration": sum(durations) / len(durations) if durations else None,
+                "runs_count": len(durations),
             }
 
     def changes_text(self, limit: int = 10) -> str:
@@ -572,7 +613,7 @@ class TelegramBot:
                 self.next_scan_at = next_scheduled_at(current_mode, datetime.now().astimezone())
             now = datetime.now().astimezone()
             if self.next_scan_at is not None and now >= self.next_scan_at:
-                self.start_scan()
+                self.start_scan("auto")
                 self.next_scan_at = next_scheduled_at(current_mode, now + timedelta(seconds=1))
             payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
             if self.offset is not None:

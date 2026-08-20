@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import typer
 from rich.console import Console
@@ -19,13 +20,13 @@ def init():
 
 @app.command()
 def baseline(limit:int=typer.Option(0,help="Limit documents for a test run")):
-    init_db(); count=asyncio.run(run_monitor(baseline=True,limit=limit)); console.print(f"Baseline created for {count} documents")
+    init_db(); started=time.monotonic(); count=asyncio.run(run_monitor(baseline=True,limit=limit,trigger="cli")); console.print(f"Baseline created for {count} documents in {time.monotonic()-started:.0f}s")
 
 @app.command()
 def run(limit:int=typer.Option(0,help="Limit documents for a test run")):
-    init_db(); count=asyncio.run(run_monitor(baseline=False,limit=limit))
+    init_db(); started=time.monotonic(); count=asyncio.run(run_monitor(baseline=False,limit=limit,trigger="cli"))
     with SessionLocal() as s: sent=asyncio.run(notify_pending(s))
-    console.print(f"Checked {count} documents; notifications sent: {sent}")
+    console.print(f"Checked {count} documents in {time.monotonic()-started:.0f}s; notifications sent: {sent}")
 
 @app.command("events")
 def events(limit:int=50):

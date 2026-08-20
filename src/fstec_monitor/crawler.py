@@ -12,7 +12,7 @@ from .config import settings
 from .db import SessionLocal
 from .extract import semantic_text
 from .http import Fetcher, conditional_headers
-from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, Snapshot
+from .models import Attachment, AttachmentVersion, BotSetting, Document, Event, ScanRun, Snapshot
 from .normalize import normalize_document_html, sha
 from .parser import canonicalize, is_document_url, parse_page
 from .storage import ObjectStore, StorageQuotaExceeded
@@ -158,9 +158,9 @@ def PathSuffix(url,ctype):
     if "opendocument" in ctype:return ".odt"
     return ".bin"
 
-async def run_monitor(baseline=False,limit=0):
+async def run_monitor(baseline=False,limit=0,trigger="cli"):
     m=Monitor()
-    urls=[]
+    urls=[]; error=""; started=datetime.now(UTC)
     try:
         with SessionLocal() as s:
             ignored=ignored_category_keys()
@@ -186,5 +186,15 @@ async def run_monitor(baseline=False,limit=0):
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
         await gather_workers(process(url) for url in urls)
-    finally: await m.close()
+    except Exception as e:
+        error=repr(e)
+        raise
+    finally:
+        await m.close()
+        try:
+            with SessionLocal() as s:
+                s.add(ScanRun(started_at=started,finished_at=datetime.now(UTC),documents=len(urls),trigger=trigger,baseline=baseline,error=error))
+                s.commit()
+        except SQLAlchemyError:  # history must never break the scan itself
+            pass
     return len(urls)
