@@ -103,6 +103,17 @@ class UserAccess(Base):
     notification_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ScanRun(Base):
+    __tablename__ = "scan_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    documents: Mapped[int] = mapped_column(Integer, default=0)
+    trigger: Mapped[str] = mapped_column(String(16), default="cli")
+    baseline: Mapped[bool] = mapped_column(Boolean, default=False)
+    error: Mapped[str] = mapped_column(Text, default="")
+
+
 class BotSetting(Base):
     __tablename__ = "bot_settings"
     key: Mapped[str] = mapped_column(String(64), primary_key=True)

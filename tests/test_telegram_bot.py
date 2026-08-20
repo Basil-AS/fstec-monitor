@@ -326,3 +326,32 @@ def test_scan_requires_confirmation_and_callback_starts_it():
     asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:run:confirm"}))
     assert started == [True]
     assert "запущена" in sent[-1][0].lower()
+
+
+def test_fmt_duration():
+    from fstec_monitor.telegram_bot import _fmt_duration
+
+    assert _fmt_duration(5) == "5 с"
+    assert _fmt_duration(65) == "1 мин 05 с"
+    assert _fmt_duration(3661) == "1 ч 01 мин"
+
+
+def test_status_text_shows_scan_duration(tmp_db):
+    import asyncio
+    import time
+    from datetime import UTC, datetime, timedelta
+
+    from fstec_monitor.models import ScanRun
+
+    with tmp_db() as session:
+        finished = datetime.now(UTC)
+        session.add(ScanRun(started_at=finished - timedelta(seconds=125), finished_at=finished, documents=42, trigger="manual"))
+        session.commit()
+    bot = TelegramBot.__new__(TelegramBot)
+    bot._quota_cache = (time.monotonic(), (0, 5 * 1024**3))
+    bot.scan_is_running = lambda: False
+
+    text = asyncio.run(bot.status_text())
+
+    assert "Длительность последней проверки: 2 мин 05 с" in text
+    assert "Средняя длительность (1 зап.)" in text
