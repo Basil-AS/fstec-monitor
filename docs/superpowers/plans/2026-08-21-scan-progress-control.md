@@ -24,11 +24,11 @@
 - Modify: `src/fstec_monitor/telegram_bot.py`
 - Test: `tests/test_telegram_bot.py`
 
-- [ ] Добавить failing-тесты для состояния idle/running/completed/failed/cancelled, форматирования прогресса и запрета второго запуска.
-- [ ] Запустить focused tests и убедиться, что они падают по отсутствующему состоянию/методам.
-- [ ] Реализовать `ScanProgress`, `scan_progress_text()`, `start_scan()` с сохранением последнего результата и `stop_scan()` через `asyncio.Event`.
-- [ ] Запустить focused tests и получить GREEN.
-- [ ] Зафиксировать коммит `feat(bot): track scan progress and lifecycle`.
+- [x] Добавить failing-тесты для состояния idle/running/completed/failed/cancelled, форматирования прогресса и запрета второго запуска.
+- [x] Запустить focused tests и убедиться, что они падают по отсутствующему состоянию/методам.
+- [x] Реализовать `ScanProgress`, `scan_progress_card()`, `start_scan()` с сохранением последнего результата и `stop_scan()` через `asyncio.Event`.
+- [x] Запустить focused tests и получить GREEN.
+- [x] Зафиксировать коммит `feat(bot): track scan progress and lifecycle`.
 
 ### Task 2: Прогресс из crawler
 
@@ -37,12 +37,12 @@
 - Modify: `src/fstec_monitor/telegram_bot.py`
 - Test: `tests/test_crawler.py`
 
-- [ ] Написать failing-тест на callbacks после discovery, после каждого URL и при отмене.
-- [ ] Запустить focused tests и увидеть RED.
-- [ ] Добавить callback `progress(stage, completed, total, errors)` и `cancel_event` в `run_monitor`; проверять отмену между worker-задачами и закрывать monitor в `finally`.
-- [ ] Передать callback из `_scan_task`, обновлять объект состояния без блокировки event loop.
-- [ ] Запустить crawler tests и получить GREEN.
-- [ ] Зафиксировать коммит `feat(crawler): report progress and support cancellation`.
+- [x] Написать failing-тест на callbacks после discovery, после каждого URL и при отмене.
+- [x] Запустить focused tests и увидеть RED.
+- [x] Добавить callback `progress(stage, completed, total, errors)` и `cancel_event` в `run_monitor`; проверять отмену между worker-задачами и закрывать monitor в `finally`.
+- [x] Передать callback из `_scan_task`, обновлять объект состояния без блокировки event loop.
+- [x] Запустить crawler tests и получить GREEN.
+- [x] Зафиксировать коммит `feat(crawler): report progress and support cancellation`.
 
 ### Task 3: Telegram UX управления
 
@@ -50,12 +50,12 @@
 - Modify: `src/fstec_monitor/telegram_bot.py`
 - Test: `tests/test_telegram_bot.py`
 
-- [ ] Написать failing-тесты на карточку статуса, callbacks `scan:status`, `scan:stop:confirm`, `scan:retry` и отсутствие второго запуска.
-- [ ] Запустить focused tests и увидеть RED.
-- [ ] Добавить inline-клавиатуры запуска/обновления/остановки/повтора, обработать подтверждение остановки и редактирование сообщения.
-- [ ] Встроить карточку в `/status`, `📊 Статус` и `🔍 Проверить сейчас`; ограничить callbacks admin ID.
-- [ ] Запустить focused tests и получить GREEN.
-- [ ] Зафиксировать коммит `feat(bot): add scan control card`.
+- [x] Написать failing-тесты на карточку статуса, callbacks `scan:status`, `scan:stop:confirm`, `scan:retry` и отсутствие второго запуска.
+- [x] Запустить focused tests и увидеть RED.
+- [x] Добавить inline-клавиатуры запуска/обновления/повтора и подтверждение остановки.
+- [x] Встроить карточку в `/status`, `📊 Статус` и `🔍 Проверить сейчас`; ограничить callbacks admin ID.
+- [x] Запустить focused tests и получить GREEN.
+- [x] Зафиксировать коммит `feat(bot): add scan control card`.
 
 ### Task 4: Ошибки, документация и remote rollout
 

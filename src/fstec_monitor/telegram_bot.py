@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -81,6 +82,23 @@ USER_LABEL_COMMANDS = {
     "ℹ️ Помощь": "/help",
 }
 USER_ALLOWED_COMMANDS = {"/start", "/help", "/changes", "/my_ignore"}
+
+
+@dataclass
+class ScanProgress:
+    state: str = "idle"
+    stage: str = "Проверка не запущена"
+    completed: int = 0
+    total: int = 0
+    errors: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_error: str = ""
+    documents: int = 0
+
+    @property
+    def percent(self) -> int:
+        return round(self.completed * 100 / self.total) if self.total else 0
 
 
 def api_url(api_root: str, token: str, method: str) -> str:
@@ -169,6 +187,8 @@ class TelegramBot:
         self.offset: int | None = None
         self.scan_lock = asyncio.Lock()
         self.scan_task: asyncio.Task[int] | None = None
+        self.scan_cancel_event = asyncio.Event()
+        self.scan_progress = ScanProgress()
         self.next_scan_at: datetime | None = None
         self.schedule_mode: str | None = None
         self.client = httpx.AsyncClient(timeout=40)
@@ -222,10 +242,15 @@ class TelegramBot:
         if not body.get("ok"):
             raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
 
-    async def scan(self, baseline: bool = False, trigger: str = "manual") -> int:
+    async def scan(self, baseline: bool = False, trigger: str = "manual", progress_callback=None, cancel_event=None) -> int:
         async with self.scan_lock:
             from .crawler import run_monitor
-            count = await run_monitor(baseline=baseline, trigger=trigger)
+            count = await run_monitor(
+                baseline=baseline,
+                trigger=trigger,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+            )
             with SessionLocal() as session:
                 from .notify import notify_pending
                 await notify_pending(session)
@@ -234,10 +259,27 @@ class TelegramBot:
     async def _scan_task(self, trigger: str = "manual") -> int:
         started = time.monotonic()
         try:
-            count = await self.scan(trigger=trigger)
+            count = await self.scan(
+                trigger=trigger,
+                progress_callback=self._update_scan_progress,
+                cancel_event=self.scan_cancel_event,
+            )
+            self.scan_progress.state = "completed"
+            self.scan_progress.stage = "Проверка завершена"
+            self.scan_progress.documents = count
+            self.scan_progress.finished_at = datetime.now(UTC)
             await self.send(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. Длительность: {_fmt_duration(time.monotonic() - started)}. /status")
             return count
+        except asyncio.CancelledError:
+            self.scan_progress.state = "cancelled"
+            self.scan_progress.stage = "Проверка остановлена"
+            self.scan_progress.finished_at = datetime.now(UTC)
+            raise
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+            self.scan_progress.state = "failed"
+            self.scan_progress.stage = "Проверка завершилась с ошибкой"
+            self.scan_progress.last_error = str(exc)[:500]
+            self.scan_progress.finished_at = datetime.now(UTC)
             log.exception("background scan failed")
             await self.report_error("ошибка фоновой проверки", exc)
             raise
@@ -294,9 +336,47 @@ class TelegramBot:
     def start_scan(self, trigger: str = "manual") -> bool:
         if self.scan_is_running():
             return False
+        self.scan_cancel_event = asyncio.Event()
+        self.scan_progress = ScanProgress(state="running", stage="Подготовка проверки", started_at=datetime.now(UTC))
         self.scan_task = asyncio.create_task(self._scan_task(trigger))
         self.scan_task.add_done_callback(self._scan_task_done)
         return True
+
+    def stop_scan(self) -> bool:
+        if not self.scan_is_running():
+            return False
+        self.scan_cancel_event.set()
+        self.scan_progress.state = "cancelled"
+        self.scan_progress.stage = "Остановка проверки…"
+        self.scan_progress.finished_at = datetime.now(UTC)
+        self.scan_task.cancel()
+        return True
+
+    def _update_scan_progress(self, stage: str, completed: int, total: int, errors: int = 0) -> None:
+        self.scan_progress.stage = stage
+        self.scan_progress.completed = completed
+        self.scan_progress.total = total
+        self.scan_progress.errors = errors
+
+    def scan_progress_card(self) -> tuple[str, dict]:
+        progress = getattr(self, "scan_progress", ScanProgress())
+        if progress.state == "running":
+            controls = [[
+                {"text": "🔄 Обновить", "callback_data": "scan:status"},
+                {"text": "⏹ Остановить", "callback_data": "scan:stop"},
+            ]]
+        elif progress.state in {"failed", "cancelled", "completed"}:
+            controls = [[{"text": "🔁 Повторить проверку", "callback_data": "scan:retry"}]]
+        else:
+            controls = [[{"text": "▶️ Запустить проверку", "callback_data": "scan:run:confirm"}]]
+        lines = [f"🔍 {progress.stage}"]
+        if progress.total:
+            lines.append(f"Прогресс: {progress.completed}/{progress.total} ({progress.percent}%)")
+        if progress.errors:
+            lines.append(f"Ошибок отдельных документов: {progress.errors}")
+        if progress.last_error:
+            lines.append(f"Последняя ошибка: {progress.last_error}")
+        return "\n".join(lines), {"inline_keyboard": controls}
 
     def _scan_task_done(self, task: asyncio.Task[int]) -> None:
         if self.scan_task is task:
@@ -336,7 +416,9 @@ class TelegramBot:
         used, quota = await self.quota_status()
         mode = self.get_schedule_mode()
         next_run = next_scheduled_at(mode, datetime.now().astimezone())
-        text = ("ФСТЭК Monitor\n"
+        progress_text, _ = self.scan_progress_card()
+        text = (f"{progress_text}\n\n"
+                "ФСТЭК Monitor\n"
                 f"Документы: {stats['documents']}\nВложения: {stats['attachments']}\n"
                 f"Последняя проверка: {_dt(stats['last_scan'])}\nПоследнее изменение: {_dt(stats['last_change'])}\n"
                 f"Статус изменений: {'есть новые' if stats['pending'] else 'изменений нет'}\n"
@@ -603,11 +685,51 @@ class TelegramBot:
             deleted = await asyncio.to_thread(self.clear_errors)
             await self.send(settings.telegram_admin_id, f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
             return
+        if data == ["scan", "status"]:
+            text, markup = self.scan_progress_card()
+            await self.send(settings.telegram_admin_id, text, markup)
+            return
+        if data == ["scan", "stop"]:
+            if not self.scan_is_running():
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, text, markup)
+                return
+            await self.send(settings.telegram_admin_id, "Остановить текущую проверку? Уже обработанные документы сохранятся.", {
+                "inline_keyboard": [[
+                    {"text": "⏹ Да, остановить", "callback_data": "scan:stop:confirm"},
+                    {"text": "Отмена", "callback_data": "scan:stop:cancel"},
+                ]]
+            })
+            return
+        if data == ["scan", "stop", "cancel"]:
+            text, markup = self.scan_progress_card()
+            await self.send(settings.telegram_admin_id, "Остановка отменена.\n\n" + text, markup)
+            return
+        if data == ["scan", "stop", "confirm"]:
+            if self.stop_scan():
+                await self.send(settings.telegram_admin_id, "⏹ Остановка проверки запрошена.\n\n" + self.scan_progress_card()[0], self.scan_progress_card()[1])
+            else:
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, "Проверка уже завершена.\n\n" + text, markup)
+            return
+        if data == ["scan", "retry"]:
+            if self.start_scan("retry"):
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, text, markup)
+            else:
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, "Повторный запуск не выполнен: проверка уже идёт.\n\n" + text, markup)
+            return
         if data == ["scan", "run", "cancel"]:
             await self.send(settings.telegram_admin_id, "Запуск проверки отменён.")
             return
         if data == ["scan", "run", "confirm"]:
-            await self.send(settings.telegram_admin_id, "Проверка запущена в фоне." if self.start_scan() else "Проверка уже выполняется.")
+            if self.start_scan():
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, "Проверка запущена в фоне.\n\n" + text, markup)
+            else:
+                text, markup = self.scan_progress_card()
+                await self.send(settings.telegram_admin_id, "Проверка уже выполняется.\n\n" + text, markup)
             return
         if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
             result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
@@ -698,7 +820,9 @@ class TelegramBot:
                 else:
                     await self.send(chat_id, "Меню готово.\n\n📰 Последние изменения — сводка событий\n🚫 Мои категории — персональный список скрытых категорий\nℹ️ Вы получаете только уведомления об интересующих изменениях.")
             elif command == "/status":
-                await self.send(chat_id, await self.status_text())
+                status_text = await self.status_text()
+                _, status_markup = self.scan_progress_card()
+                await self.send(chat_id, status_text, status_markup)
             elif command in {"/changes", "/events"}:
                 await self.send(chat_id, await asyncio.to_thread(self.changes_text, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10))
             elif command in {"/report", "/diff"}:
@@ -724,7 +848,8 @@ class TelegramBot:
                 await self.send(chat_id, text_out, markup)
             elif command == "/scan":
                 if self.scan_is_running():
-                    await self.send(chat_id, "Проверка уже выполняется.")
+                    progress_text, progress_markup = self.scan_progress_card()
+                    await self.send(chat_id, progress_text, progress_markup)
                 else:
                     await self.send(chat_id, "Запустить полную проверку каталога ФСТЭК сейчас?", {
                         "inline_keyboard": [[

@@ -221,11 +221,15 @@ def PathSuffix(url,ctype):
     if "opendocument" in ctype:return ".odt"
     return ".bin"
 
-async def run_monitor(baseline=False,limit=0,trigger="cli"):
+async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=None,cancel_event=None):
     m=Monitor()
-    urls=[]; error=""; started=datetime.now(UTC)
+    urls=[]; error=""; started=datetime.now(UTC); completed=0; errors_count=0
+    def report(stage, done, total, errors):
+        if progress_callback:
+            progress_callback(stage, done, total, errors)
     log.info("scan started trigger=%s baseline=%s limit=%s", trigger, baseline, limit or "none")
     try:
+        report("Обход каталога", 0, 0, 0)
         with SessionLocal() as s:
             ignored=ignored_category_keys()
             for doc in s.scalars(select(Document).where(Document.active.is_(True))).all():
@@ -240,22 +244,33 @@ async def run_monitor(baseline=False,limit=0,trigger="cli"):
             raise
         if limit: urls=urls[:limit]
         log.info("catalog discovery completed documents=%d", len(urls))
+        report("Проверка документов", 0, len(urls), 0)
         semaphore=asyncio.Semaphore(settings.max_concurrency)
         async def process(url):
+            nonlocal completed, errors_count
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError
             async with semaphore:
                 try: await m.process_document(url,baseline)
                 except StorageQuotaExceeded as e:
+                    errors_count += 1
                     with SessionLocal() as s:
                         s.add(Event(kind="storage_error", severity="critical", summary=f"квота хранилища достигнута при загрузке {url}", details=str(e))); s.commit()
                 except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
+                    errors_count += 1
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
+                finally:
+                    completed += 1
+                    report("Проверка документов", completed, len(urls), errors_count)
         await gather_workers(process(url) for url in urls)
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError
         with SessionLocal() as s:
             reconcile_document_presence(s, set(urls), baseline=baseline)
             s.commit()
         log.info("scan workers completed documents=%d", len(urls))
-    except Exception as e:
+    except BaseException as e:
         error=repr(e)
         raise
     finally:

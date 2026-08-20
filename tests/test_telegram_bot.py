@@ -16,6 +16,7 @@ from fstec_monitor.notify import (
 from fstec_monitor.reports import event_report, event_report_md
 from fstec_monitor.storage import ObjectStore
 from fstec_monitor.telegram_bot import (
+    ScanProgress,
     TelegramBot,
     admin_keyboard,
     api_url,
@@ -209,6 +210,60 @@ def test_scan_is_not_running_before_first_background_task():
     bot = TelegramBot.__new__(TelegramBot)
     bot.scan_task = None
     assert not bot.scan_is_running()
+
+
+def test_scan_progress_text_shows_stage_progress_and_controls():
+    from datetime import UTC, datetime
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_progress = ScanProgress(
+        state="running",
+        stage="Проверка документов",
+        completed=7,
+        total=20,
+        errors=2,
+        started_at=datetime.now(UTC),
+    )
+    bot.scan_task = SimpleNamespace(done=lambda: False)
+
+    text, markup = bot.scan_progress_card()
+
+    assert "Проверка документов" in text
+    assert "7/20" in text
+    assert "35%" in text
+    callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
+    assert "scan:status" in callbacks
+    assert "scan:stop" in callbacks
+
+
+def test_active_scan_cannot_be_started_twice_and_can_be_stopped():
+    import asyncio
+
+    async def run():
+        bot = TelegramBot.__new__(TelegramBot)
+        bot.scan_task = None
+        bot.scan_progress = ScanProgress()
+        bot.scan_cancel_event = asyncio.Event()
+        started = asyncio.Event()
+
+        async def fake_scan_task(_trigger="manual"):
+            started.set()
+            await bot.scan_cancel_event.wait()
+            raise asyncio.CancelledError
+
+        bot._scan_task = fake_scan_task
+        assert bot.start_scan()
+        await started.wait()
+        assert not bot.start_scan()
+        assert bot.stop_scan()
+        await asyncio.sleep(0)
+        assert bot.scan_progress.state == "cancelled"
+        await asyncio.gather(bot.scan_task, return_exceptions=True)
+        assert bot.start_scan()
+        bot.stop_scan()
+        await asyncio.gather(bot.scan_task, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_completed_background_scan_task_is_consumed_and_cleared():
@@ -496,6 +551,35 @@ def test_scan_requires_confirmation_and_callback_starts_it():
     asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:run:confirm"}))
     assert started == [True]
     assert "запущена" in sent[-1][0].lower()
+
+
+def test_scan_control_callbacks_show_progress_and_confirm_stop():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_task = SimpleNamespace(done=lambda: False)
+    bot.scan_progress = ScanProgress(state="running", stage="Проверка документов", completed=1, total=2)
+    bot.stop_scan = lambda: True
+    sent = []
+
+    async def send(_chat_id, text, markup=None):
+        sent.append((text, markup))
+
+    async def call(*_args, **_kwargs):
+        return {}
+
+    bot.send = send
+    bot.call = call
+    asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "data": "scan:status"}))
+    assert "1/2" in sent[-1][0]
+    assert sent[-1][1]["inline_keyboard"][0][1]["callback_data"] == "scan:stop"
+
+    asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:stop"}))
+    assert "Остановить" in sent[-1][0]
+    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "scan:stop:confirm"
+
+    asyncio.run(bot.handle_callback({"id": "c3", "from": {"id": 151599744}, "data": "scan:stop:confirm"}))
+    assert "остановка" in sent[-1][0].lower()
 
 
 def test_fmt_duration():

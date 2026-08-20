@@ -157,6 +157,9 @@ class _FakeMonitor:
     async def close(self):
         return None
 
+    async def process_document(self, _url, baseline=False):
+        return None
+
 
 def _scan_db(monkeypatch, tmp_path, monitor):
     engine = create_engine(f"sqlite:///{tmp_path}/scan.db")
@@ -180,6 +183,34 @@ def test_run_monitor_records_scan_run(monkeypatch, tmp_path):
         assert run.documents == 0
         assert run.finished_at is not None
         assert run.error == ""
+
+
+def test_run_monitor_reports_discovery_and_document_progress(monkeypatch, tmp_path):
+    session_factory = _scan_db(monkeypatch, tmp_path, lambda: _FakeMonitor(urls={"a", "b"}))
+    progress = []
+
+    count = asyncio.run(crawler.run_monitor(trigger="manual", progress_callback=lambda *args: progress.append(args)))
+
+    assert count == 2
+    assert progress[0] == ("Обход каталога", 0, 0, 0)
+    assert progress[-1] == ("Проверка документов", 2, 2, 0)
+    assert len(progress) >= 3
+    with session_factory() as session:
+        assert session.scalar(select(ScanRun).order_by(ScanRun.id.desc())).finished_at is not None
+
+
+def test_run_monitor_honors_cancellation_event(monkeypatch, tmp_path):
+    session_factory = _scan_db(monkeypatch, tmp_path, lambda: _FakeMonitor(urls={"a", "b"}))
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(crawler.run_monitor(cancel_event=cancel_event))
+
+    with session_factory() as session:
+        run = session.scalar(select(ScanRun).order_by(ScanRun.id.desc()))
+        assert run is not None
+        assert run.error
 
 
 def test_run_monitor_records_failed_scan_run(monkeypatch, tmp_path):
