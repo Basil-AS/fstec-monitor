@@ -186,8 +186,8 @@ def test_settings_keyboard_contains_all_schedule_modes():
         if "callback_data" in button
     ]
 
-    assert "settings:set:daily_noon" in callback_data
-    assert "settings:set:disabled" in callback_data
+    assert "v1:settings:set-daily_noon" in callback_data
+    assert "v1:settings:set-disabled" in callback_data
 
 
 def test_settings_text_shows_schedule_and_next_run():
@@ -332,8 +332,8 @@ def test_scan_progress_text_shows_stage_progress_and_controls():
     assert "7/20" in text
     assert "35%" in text
     callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
-    assert "scan:status" in callbacks
-    assert "scan:stop" in callbacks
+    assert "v1:scan:status" in callbacks
+    assert "v1:scan:stop" in callbacks
 
 
 def test_active_scan_cannot_be_started_twice_and_can_be_stopped():
@@ -551,7 +551,7 @@ def test_ignore_toggle_persists_category(tmp_db):
     assert bot.ignored_categories_db() == ["Приказы"]
     text, markup = bot.ignore_text()
     assert "Приказы" in text
-    assert any(f"ignore:t:{token}" == b["callback_data"] for row in markup["inline_keyboard"] for b in row)
+    assert any(f"v1:ignore:{token}" == b["callback_data"] for row in markup["inline_keyboard"] for b in row)
     assert "снова отслеживается" in bot.toggle_ignored_category(token)
     assert bot.ignored_categories_db() == []
     assert bot.toggle_ignored_category("0" * 16) is None
@@ -572,7 +572,7 @@ def test_user_ignore_toggle_is_private_to_that_user(tmp_db):
     assert bot.user_ignored_categories(43) == []
     text, markup = bot.user_ignore_text(42)
     assert "Приказы" in text
-    assert any(f"userignore:t:{token}" == button["callback_data"] for row in markup["inline_keyboard"] for button in row)
+    assert any(f"v1:userignore:{token}" == button["callback_data"] for row in markup["inline_keyboard"] for button in row)
 
 
 def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):
@@ -642,7 +642,7 @@ def test_scan_requires_confirmation_and_callback_starts_it():
     asyncio.run(bot.handle(admin_update))
     assert started == []
     assert "Запустить полную проверку" in sent[-1][0]
-    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "scan:run:confirm"
+    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:run"
 
     asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "data": "scan:run:cancel"}))
     assert started == []
@@ -672,7 +672,7 @@ def test_scan_control_callbacks_show_progress_and_confirm_stop():
     bot.call = call
     asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "data": "scan:status"}))
     assert "1/2" in sent[-1][0]
-    assert sent[-1][1]["inline_keyboard"][0][1]["callback_data"] == "scan:stop"
+    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:stop"
 
     asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:stop"}))
     assert "Остановить" in sent[-1][0]

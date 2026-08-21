@@ -15,6 +15,7 @@ _ALLOWED_ACTIONS: Final = {
     "errors",
     "screen",
     "nav",
+    "userignore",
 }
 
 

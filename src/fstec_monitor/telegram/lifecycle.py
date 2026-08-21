@@ -124,7 +124,7 @@ class MessageLifecycleManager:
             if hasattr(self.transport, "edit_message_reply_markup"):
                 try:
                     await self.transport.edit_message_reply_markup(chat_id, message_id, {"inline_keyboard": []})
-                except Exception as exc:
+                except (OSError, RuntimeError, TimeoutError) as exc:
                     log.debug("media markup cleanup skipped chat=%s message=%s: %s", chat_id, message_id, exc)
             return
         try:

@@ -31,6 +31,12 @@ class NavigationStack:
         if not self._screens or self.current != screen or self.current_payload != payload:
             self._screens.append((screen, payload))
 
+    def replace(self, screen: str, payload: object | None = None) -> None:
+        if self._screens:
+            self._screens[-1] = (screen, payload)
+        else:
+            self.reset(screen)
+
     def back(self) -> str:
         if len(self._screens) > 1:
             self._screens.pop()

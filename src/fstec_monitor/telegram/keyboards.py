@@ -74,6 +74,15 @@ def settings_keyboard(notifications_enabled: bool = True) -> dict:
     return {"inline_keyboard": [[{"text": label, "callback_data": callback}] for label, callback in options]}
 
 
+def scan_confirmation_keyboard() -> dict:
+    return {
+        "inline_keyboard": [[
+            {"text": "▶️ Запустить", "callback_data": encode_callback("scan", "run")},
+            {"text": "✕ Отмена", "callback_data": encode_callback("scan", "run-cancel")},
+        ], [{"text": "🏠 Главное меню", "callback_data": encode_callback("menu", "main")}]],
+    }
+
+
 def scan_keyboard(state: str) -> dict:
     if state == "running":
         options = (
