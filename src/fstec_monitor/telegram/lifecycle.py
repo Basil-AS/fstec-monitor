@@ -25,14 +25,21 @@ class MessageTransport(Protocol):
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         ...
 
+    async def edit_message_reply_markup(self, chat_id: int, message_id: int, reply_markup: dict | None = None) -> None:
+        ...
+
 
 @dataclass
 class ScreenSession:
     chat_id: int
     message_id: int | None = None
+    last_message_id: int | None = None
     screen: str = "main"
     payload: tuple[str, dict | None] | None = None
     persistent_message_ids: set[int] = field(default_factory=set)
+    temporary_message_ids: set[int] = field(default_factory=set)
+    context_message_ids: set[int] = field(default_factory=set)
+    generation: int = 0
 
 
 class MessageLifecycleManager:
@@ -52,12 +59,93 @@ class MessageLifecycleManager:
     def session(self, chat_id: int) -> ScreenSession:
         return self._sessions.setdefault(chat_id, ScreenSession(chat_id=chat_id))
 
-    def adopt_screen(self, chat_id: int, message_id: int, screen: str = "main") -> None:
+    def remember_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        screen: str | None = None,
+        persistent: bool = False,
+        temporary: bool = False,
+        context: bool = False,
+    ) -> None:
         session = self.session(chat_id)
-        if session.message_id is None:
+        session.last_message_id = max(session.last_message_id or 0, message_id)
+        if persistent:
+            session.persistent_message_ids.add(message_id)
+        if temporary:
+            session.temporary_message_ids.add(message_id)
+        if context:
+            session.context_message_ids.add(message_id)
+        if screen is not None:
+            session.message_id = message_id
+            session.screen = screen
+
+    def remember_context_message(self, chat_id: int, message: dict | None) -> None:
+        message_id = (message or {}).get("message_id")
+        if isinstance(message_id, int):
+            self.remember_message(chat_id, message_id, context=True)
+
+    @staticmethod
+    def is_media_message(message: dict | None) -> bool:
+        message = message or {}
+        return any(message.get(key) for key in (
+            "audio", "document", "photo", "video", "animation", "voice", "video_note", "sticker",
+        ))
+
+    def is_chat_tail(self, chat_id: int, message_id: int | None) -> bool:
+        if not message_id:
+            return False
+        known_tail = self.session(chat_id).last_message_id
+        return known_tail is None or message_id >= known_tail
+
+    def adopt_screen(
+        self,
+        chat_id: int,
+        message_id: int,
+        screen: str = "main",
+        *,
+        message: dict | None = None,
+    ) -> None:
+        session = self.session(chat_id)
+        if session.message_id is None and not self.is_media_message(message) and self.is_chat_tail(chat_id, message_id):
             session.message_id = message_id
             session.screen = screen
             session.payload = None
+        self.remember_message(chat_id, message_id, context=True)
+
+    async def cleanup_trigger_message(self, chat_id: int, message: dict | None) -> None:
+        message = message or {}
+        message_id = message.get("message_id")
+        if not isinstance(message_id, int):
+            return
+        session = self.session(chat_id)
+        if self.is_media_message(message) or message_id in session.persistent_message_ids:
+            if hasattr(self.transport, "edit_message_reply_markup"):
+                try:
+                    await self.transport.edit_message_reply_markup(chat_id, message_id, {"inline_keyboard": []})
+                except (OSError, RuntimeError, TimeoutError) as exc:
+                    log.debug("media markup cleanup skipped chat=%s message=%s: %s", chat_id, message_id, exc)
+            return
+        try:
+            await self.transport.delete_message(chat_id, message_id)
+        except (OSError, RuntimeError, TimeoutError):
+            pass
+        session.context_message_ids.discard(message_id)
+        if session.last_message_id == message_id:
+            session.last_message_id = session.message_id
+
+    async def cleanup_old_menu(self, chat_id: int, except_message_id: int | None = None) -> None:
+        session = self.session(chat_id)
+        message_id = session.message_id
+        if not message_id or message_id == except_message_id or message_id in session.persistent_message_ids:
+            return
+        try:
+            await self.transport.delete_message(chat_id, message_id)
+        except (OSError, RuntimeError, TimeoutError):
+            pass
+        session.message_id = None
+        session.payload = None
 
     def _lock(self, chat_id: int) -> asyncio.Lock:
         return self._locks.setdefault(chat_id, asyncio.Lock())
@@ -68,28 +156,49 @@ class MessageLifecycleManager:
         screen: str,
         text: str,
         reply_markup: dict | None = None,
+        *,
+        source_message: dict | None = None,
+        reason: str = "navigation",
     ) -> int | None:
         async with self._lock(chat_id):
             session = self.session(chat_id)
+            source_message_id = (source_message or {}).get("message_id")
+            source_is_media = self.is_media_message(source_message)
+            if source_message_id and source_is_media:
+                await self.cleanup_trigger_message(chat_id, source_message)
             payload = (text, reply_markup)
             if session.message_id is not None and session.payload == payload and session.screen == screen:
                 return session.message_id
-            if session.message_id is None:
-                message_id = await self.transport.send(chat_id, text, reply_markup)
-            else:
+            can_edit = (
+                session.message_id is not None
+                and session.message_id not in session.persistent_message_ids
+                and not source_is_media
+                and self.is_chat_tail(chat_id, session.message_id)
+            )
+            if can_edit:
+                current_message_id = session.message_id
                 try:
-                    await self.transport.edit_message(chat_id, session.message_id, text, reply_markup)
-                    message_id = session.message_id
+                    await self.transport.edit_message(chat_id, current_message_id, text, reply_markup)
+                    message_id = current_message_id
                 except Exception as exc:
                     if is_not_modified(exc):
-                        message_id = session.message_id
+                        message_id = current_message_id
                     elif is_missing_message(exc):
                         message_id = await self.transport.send(chat_id, text, reply_markup)
                     else:
                         raise
+            else:
+                if session.message_id is not None and session.message_id not in session.persistent_message_ids:
+                    await self.cleanup_old_menu(chat_id)
+                message_id = await self.transport.send(chat_id, text, reply_markup)
+            if message_id is None:
+                return None
             session.message_id = message_id
+            session.last_message_id = message_id
             session.screen = screen
             session.payload = payload
+            session.generation += 1
+            log.debug("screen rendered chat=%s message=%s screen=%s reason=%s", chat_id, message_id, screen, reason)
             return message_id
 
     async def show_progress(
@@ -108,7 +217,8 @@ class MessageLifecycleManager:
     ) -> int | None:
         async with self._lock(chat_id):
             message_id = await self.transport.send(chat_id, text, reply_markup)
-            self.session(chat_id).persistent_message_ids.add(message_id)
+            if message_id is not None:
+                self.remember_message(chat_id, message_id, persistent=True)
             return message_id
 
     async def show_temporary(
@@ -121,6 +231,8 @@ class MessageLifecycleManager:
             message_id = await self.transport.send(chat_id, text)
         if message_id is None:
             return None
+        self.session(chat_id).temporary_message_ids.add(message_id)
+        self.remember_message(chat_id, message_id, temporary=True)
         task = asyncio.create_task(self._delete_temporary(chat_id, message_id, ttl))
         self._temporary_tasks.setdefault(chat_id, set()).add(task)
         task.add_done_callback(self._temporary_tasks[chat_id].discard)
@@ -132,6 +244,7 @@ class MessageLifecycleManager:
             await self.transport.delete_message(chat_id, message_id)
         except (OSError, RuntimeError, TimeoutError):
             return
+        self.session(chat_id).temporary_message_ids.discard(message_id)
 
     async def close_screen(self, chat_id: int) -> None:
         async with self._lock(chat_id):
@@ -147,6 +260,8 @@ class MessageLifecycleManager:
                 log.debug("screen message cleanup failed chat=%s message=%s: %s", chat_id, message_id, exc)
             session.message_id = None
             session.payload = None
+            if session.last_message_id == message_id:
+                session.last_message_id = None
             session.screen = "main"
 
     async def close(self) -> None:
@@ -179,6 +294,7 @@ class ProgressCoalescer:
         self._latest = None
         self._task: asyncio.Task[None] | None = None
         self._closed = False
+        self._first_render = True
 
     def submit(self, value) -> None:
         if self._closed:
@@ -189,8 +305,9 @@ class ProgressCoalescer:
 
     async def _run(self) -> None:
         while not self._closed and self._latest is not None:
-            if self.interval:
+            if self.interval and not self._first_render:
                 await asyncio.sleep(self.interval)
+            self._first_render = False
             value = self._latest
             self._latest = None
             result = self.renderer(value)

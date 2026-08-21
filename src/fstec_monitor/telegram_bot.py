@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -29,10 +30,7 @@ from .models import (
 from .normalize import normalize_space
 from .reports import event_report_md, safe_filename
 from .schedule import (
-    DAILY_MIDNIGHT,
     DAILY_NOON,
-    DISABLED,
-    EVERY_TWO_HOURS,
     SCHEDULE_MODES,
     next_scheduled_at,
     schedule_label,
@@ -42,6 +40,7 @@ from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
+from .telegram.rendering import has_html_markup, render_scan_progress
 
 log = logging.getLogger(__name__)
 MEANINGFUL_KINDS = {
@@ -130,16 +129,7 @@ def is_user_command_allowed(command: str) -> bool:
 
 
 def settings_keyboard(notifications_enabled: bool = True) -> dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ Раз в сутки · 12:00", "callback_data": f"settings:set:{DAILY_NOON}"}],
-            [{"text": "Раз в сутки · 00:00", "callback_data": f"settings:set:{DAILY_MIDNIGHT}"}],
-            [{"text": "Каждые 2 часа", "callback_data": f"settings:set:{EVERY_TWO_HOURS}"}],
-            [{"text": "⏸ Выключить автозапуск", "callback_data": f"settings:set:{DISABLED}"}],
-            [{"text": f"{'🔔' if notifications_enabled else '🔕'} Уведомления: {'включены' if notifications_enabled else 'выключены'}", "callback_data": "settings:notifications:toggle"}],
-            [{"text": "↩️ Главное меню", "callback_data": "menu:main"}],
-        ]
-    }
+    return telegram_keyboards.settings_keyboard(notifications_enabled)
 
 
 def _dt(value) -> str:
@@ -207,7 +197,14 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
         return body.get("result", {})
 
-    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int | None:
+    def _log_tgux(self, method: str, payload: dict, *, screen: str | None = None, reason: str = "api") -> None:
+        if os.getenv("FSTEC_TGUX_LOGGING", "0").casefold() not in {"1", "true", "yes", "on"}:
+            return
+        chat_id = payload.get("chat_id", "?")
+        message_id = payload.get("message_id", "-")
+        log.info("TGUX chat=%s method=%s message_id=%s screen=%s reason=%s", chat_id, method, message_id, screen or "-", reason)
+
+    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None, *, screen: str | None = None, reason: str = "navigation") -> int | None:
         message_id = None
         for start in range(0, len(text), 3900):
             payload = {
@@ -215,26 +212,51 @@ class TelegramBot:
                 "text": text[start:start + 3900],
                 "link_preview_options": {"is_disabled": True},
             }
+            if has_html_markup(text):
+                payload["parse_mode"] = "HTML"
             if reply_markup is not None:
                 payload["reply_markup"] = reply_markup
+            self._log_tgux("sendMessage", payload, screen=screen, reason=reason)
             result = await self.call("sendMessage", payload)
             if isinstance(result, dict):
                 message_id = result.get("message_id", message_id)
         return message_id
 
-    async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None, *, screen: str | None = None, reason: str = "navigation") -> None:
         payload = {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
             "link_preview_options": {"is_disabled": True},
         }
+        if has_html_markup(text):
+            payload["parse_mode"] = "HTML"
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
+        self._log_tgux("editMessageText", payload, screen=screen, reason=reason)
         await self.call("editMessageText", payload)
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
-        await self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        payload = {"chat_id": chat_id, "message_id": message_id}
+        self._log_tgux("deleteMessage", payload, reason="cleanup")
+        await self.call("deleteMessage", payload)
+
+    async def edit_message_reply_markup(self, chat_id: int, message_id: int, reply_markup: dict | None = None) -> None:
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup or {"inline_keyboard": []}}
+        self._log_tgux("editMessageReplyMarkup", payload, reason="stale-media-keyboard")
+        await self.call("editMessageReplyMarkup", payload)
+
+    async def answer_callback(self, callback_query_id: str, text: str = "") -> None:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:200]
+        self._log_tgux("answerCallbackQuery", payload, reason="callback-toast")
+        await self.call("answerCallbackQuery", payload)
+
+    async def send_chat_action(self, chat_id: int, action: str) -> None:
+        payload = {"chat_id": chat_id, "action": action}
+        self._log_tgux("sendChatAction", payload, reason="long-operation")
+        await self.call("sendChatAction", payload)
 
     async def _delete_later(self, chat_id: int, message_id: int, ttl: float) -> None:
         await asyncio.sleep(ttl)
@@ -275,7 +297,9 @@ class TelegramBot:
         except (OSError, RuntimeError, httpx.HTTPError) as exc:
             log.warning("could not set Telegram chat menu button: %s", exc)
 
-    async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> None:
+    async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> int | None:
+        self._log_tgux("sendDocument", {"chat_id": chat_id}, reason="persistent-report")
+        await self.send_chat_action(chat_id, "upload_document")
         response = await self.client.post(
             api_url(settings.telegram_api_root, self.token, "sendDocument"),
             data={"chat_id": str(chat_id), "caption": caption[:900]},
@@ -285,6 +309,11 @@ class TelegramBot:
         body = response.json()
         if not body.get("ok"):
             raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
+        result = body.get("result") or {}
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if message_id and getattr(self, "lifecycle", None) is not None:
+            self.lifecycle.remember_message(chat_id, message_id, persistent=True)
+        return message_id
 
     async def scan(self, baseline: bool = False, trigger: str = "manual", progress_callback=None, cancel_event=None) -> int:
         async with self.scan_lock:
@@ -301,7 +330,6 @@ class TelegramBot:
             return count
 
     async def _scan_task(self, trigger: str = "manual") -> int:
-        started = time.monotonic()
         try:
             count = await self.scan(
                 trigger=trigger,
@@ -313,8 +341,6 @@ class TelegramBot:
             self.scan_progress.documents = count
             self.scan_progress.finished_at = datetime.now(UTC)
             await self.refresh_scan_status()
-            if getattr(self, "scan_status_message", None) is None:
-                await self.send_temporary(settings.telegram_admin_id, f"✅ Проверка завершена. Обработано документов: {count}. Длительность: {_fmt_duration(time.monotonic() - started)}.")
             return count
         except asyncio.CancelledError:
             self.scan_progress.state = "cancelled"
@@ -445,23 +471,15 @@ class TelegramBot:
 
     def scan_progress_card(self) -> tuple[str, dict]:
         progress = getattr(self, "scan_progress", ScanProgress())
-        if progress.state == "running":
-            controls = [[
-                {"text": "🔄 Обновить", "callback_data": "scan:status"},
-                {"text": "⏹ Остановить", "callback_data": "scan:stop"},
-            ]]
-        elif progress.state in {"failed", "cancelled", "completed"}:
-            controls = [[{"text": "🔁 Повторить проверку", "callback_data": "scan:retry"}]]
-        else:
-            controls = [[{"text": "▶️ Запустить проверку", "callback_data": "scan:run:confirm"}]]
-        lines = [f"🔍 {progress.stage}"]
-        if progress.total:
-            lines.append(f"Прогресс: {progress.completed}/{progress.total} ({progress.percent}%)")
-        if progress.errors:
-            lines.append(f"Ошибок отдельных документов: {progress.errors}")
-        if progress.last_error:
-            lines.append(f"Последняя ошибка: {progress.last_error}")
-        return "\n".join(lines), {"inline_keyboard": controls}
+        controls = telegram_keyboards.scan_keyboard(progress.state)
+        elapsed = ""
+        if progress.started_at:
+            end = progress.finished_at or datetime.now(UTC)
+            elapsed = f"\nПрошло: {_fmt_duration((end - progress.started_at).total_seconds())}"
+        rendered = render_scan_progress(progress)
+        if progress.documents:
+            rendered += f"\nНайдено изменений: {progress.documents}"
+        return rendered + elapsed, controls
 
     def _scan_task_done(self, task: asyncio.Task[int]) -> None:
         if self.scan_task is task:
@@ -547,11 +565,35 @@ class TelegramBot:
                 "runs_count": len(durations),
             }
 
-    def changes_text(self, limit: int = 10) -> str:
+    def changes_text(self, limit: int = 10, offset: int = 0) -> str:
         with SessionLocal() as session:
-            events = session.scalars(select(Event).where(Event.kind.in_(MEANINGFUL_KINDS)).order_by(Event.id.desc()).limit(max(1, min(limit, 30)))).all()
+            events = session.scalars(
+                select(Event)
+                .where(Event.kind.in_(MEANINGFUL_KINDS))
+                .order_by(Event.id.desc())
+                .offset(max(0, offset))
+                .limit(max(1, min(limit, 30)))
+            ).all()
             docs = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))).all()}
         return "\n".join(f"#{e.id} {_dt(e.created_at)} {e.kind}: {docs.get(e.document_id).title if docs.get(e.document_id) else e.summary}" for e in events) or "Изменений нет."
+
+    def changes_page(self, page: int = 0, page_size: int = 5) -> tuple[str, list[list[dict]]]:
+        page_size = max(1, min(page_size, 10))
+        with SessionLocal() as session:
+            total = session.scalar(select(func.count(Event.id)).where(Event.kind.in_(MEANINGFUL_KINDS))) or 0
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, pages - 1))
+        text = self.changes_text(page_size, page * page_size)
+        if pages == 1:
+            return text, []
+        previous = page - 1 if page else pages - 1
+        following = page + 1 if page + 1 < pages else 0
+        controls = [[
+            {"text": "◀️", "callback_data": telegram_keyboards.encode_callback("screen", f"changes-page-{previous}")},
+            {"text": f"{page + 1}/{pages}", "callback_data": telegram_keyboards.encode_callback("nav", "noop")},
+            {"text": "▶️", "callback_data": telegram_keyboards.encode_callback("screen", f"changes-page-{following}")},
+        ]]
+        return text, controls
 
     def users_text(self) -> tuple[str, dict | None]:
         with SessionLocal() as session:
@@ -615,7 +657,7 @@ class TelegramBot:
             hidden = category_key(category) in ignored_keys
             buttons.append([{
                 "text": f"{'✅' if hidden else '👁️'} {category[:40]}",
-                "callback_data": f"userignore:t:{category_token(category)}",
+                "callback_data": telegram_keyboards.encode_callback("userignore", category_token(category)),
             }])
         return "\n".join(lines), {"inline_keyboard": buttons} if buttons else None
 
@@ -663,7 +705,7 @@ class TelegramBot:
         for category in known[:20]:
             ignored = category_key(category) in db_keys or category_key(category) in set(env_ignored)
             mark = "🚫" if ignored else "👁"
-            buttons.append([{"text": f"{mark} {category[:40]}", "callback_data": f"ignore:t:{category_token(category)}"}])
+            buttons.append([{"text": f"{mark} {category[:40]}", "callback_data": telegram_keyboards.encode_callback("ignore", category_token(category))}])
         if not buttons:
             return "\n".join(lines), None
         lines.append("")
@@ -741,18 +783,37 @@ class TelegramBot:
         markup: dict | None = None,
         *,
         reset: bool = False,
+        source_message: dict | None = None,
+        reason: str = "navigation",
+        payload: object | None = None,
     ) -> int | None:
         stack = self._navigation_stack(chat_id)
         if reset:
             stack.reset(screen)
         else:
-            stack.push(screen)
+            stack.push(screen, payload)
         lifecycle = getattr(self, "lifecycle", None)
         if lifecycle is None:
             return await self.send(chat_id, text, markup)
-        return await lifecycle.show_screen(chat_id, screen, text, markup)
+        return await lifecycle.show_screen(
+            chat_id,
+            screen,
+            text,
+            markup,
+            source_message=source_message,
+            reason=reason,
+        )
 
-    async def _render_screen(self, chat_id: int, screen: str, *, reset: bool = False) -> int | None:
+    async def _render_screen(
+        self,
+        chat_id: int,
+        screen: str,
+        *,
+        reset: bool = False,
+        source_message: dict | None = None,
+        reason: str = "navigation",
+        payload: object | None = None,
+    ) -> int | None:
         is_admin_user = chat_id == settings.telegram_admin_id
         if screen == "main":
             view = main_screen(is_admin=is_admin_user)
@@ -761,7 +822,9 @@ class TelegramBot:
             _, markup = self.scan_progress_card()
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []))
         elif screen == "changes":
-            view = screen_with_navigation(screen, await asyncio.to_thread(self.changes_text), [])
+            page = payload.get("page", 0) if isinstance(payload, dict) else 0
+            text, rows = await asyncio.to_thread(self.changes_page, page)
+            view = screen_with_navigation(screen, text, rows)
         elif screen == "scan":
             text, markup = self.scan_progress_card()
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []))
@@ -784,14 +847,45 @@ class TelegramBot:
             view = screen_with_navigation(screen, text, [])
         else:
             view = screen_with_navigation(screen, "ℹ️ Раздел готов. Используйте кнопки ниже.", [])
-        return await self._show_screen(chat_id, view.name, view.text, view.markup, reset=reset)
+        return await self._show_screen(
+            chat_id,
+            view.name,
+            view.text,
+            view.markup,
+            reset=reset,
+            source_message=source_message,
+            reason=reason,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _callback_toast(data: str) -> str:
+        if data.startswith("v1:settings:"):
+            return "Сохраняю настройки…"
+        if data.startswith("v1:scan:run"):
+            return "Запускаю проверку…"
+        if data.startswith("v1:scan:stop"):
+            return "Останавливаю проверку…"
+        if data.startswith("v1:scan:retry"):
+            return "Повторяю проверку…"
+        if data.startswith(("v1:ignore:", "v1:userignore:")):
+            return "Обновляю фильтр…"
+        if data.startswith("v1:nav:"):
+            return "Открываю…"
+        return "Обновлено"
 
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
+        raw_data = callback.get("data") or ""
         if callback_id:
             try:
-                await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
+                toast = self._callback_toast(raw_data)
+                answer = getattr(self, "answer_callback", None)
+                if answer is not None:
+                    await answer(callback_id, toast)
+                else:
+                    await self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": toast})
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 log.warning("answerCallbackQuery failed (expired query?): %s", exc)
 
@@ -805,7 +899,14 @@ class TelegramBot:
                 if (callback.get("data") or "").startswith("scan:"):
                     self.remember_scan_message(chat_id, message_id or lifecycle.session(chat_id).message_id)
                 screen = self._navigation_stack(chat_id).current
-                await lifecycle.show_screen(chat_id, screen, text, markup)
+                await lifecycle.show_screen(
+                    chat_id,
+                    screen,
+                    text,
+                    markup,
+                    source_message=message,
+                    reason="callback",
+                )
                 return
             if chat_id and message_id:
                 if (callback.get("data") or "").startswith("scan:"):
@@ -820,7 +921,6 @@ class TelegramBot:
             await self.send(fallback_chat_id or chat_id or settings.telegram_admin_id, text, markup)
 
         sender_id = sender.get("id")
-        raw_data = callback.get("data") or ""
         data = raw_data.split(":")
         decoded = decode_callback(raw_data)
         message = callback.get("message") or {}
@@ -829,7 +929,7 @@ class TelegramBot:
         message_id = message.get("message_id")
         lifecycle = getattr(self, "lifecycle", None)
         if lifecycle is not None and chat_id and message_id:
-            lifecycle.adopt_screen(chat_id, message_id)
+            lifecycle.adopt_screen(chat_id, message_id, self._navigation_stack(chat_id).current, message=message)
         if decoded:
             action, value = decoded
             admin_screens = {"status", "scan", "settings", "filters", "users", "errors"}
@@ -842,15 +942,62 @@ class TelegramBot:
                 if not is_allowed(user):
                     return
             if action == "menu" and value == "main":
-                await self._render_screen(chat_id or sender_id, "main", reset=True)
+                await self._render_screen(chat_id or sender_id, "main", reset=True, source_message=message)
                 return
             if action == "nav" and value == "back":
                 stack = self._navigation_stack(chat_id or sender_id)
-                await self._render_screen(chat_id or sender_id, stack.back(), reset=True)
+                await self._render_screen(chat_id or sender_id, stack.back(), reset=True, source_message=message, reason="back")
                 return
             if action == "screen":
-                await self._render_screen(chat_id or sender_id, value)
+                if value.startswith("changes-page-"):
+                    page = value.removeprefix("changes-page-")
+                    if page.isdigit():
+                        stack = self._navigation_stack(chat_id or sender_id)
+                        stack.replace("changes", {"page": int(page)})
+                        await self._render_screen(chat_id or sender_id, "changes", source_message=message, payload={"page": int(page)})
+                    return
+                await self._render_screen(chat_id or sender_id, value, source_message=message)
                 return
+            if action == "scan":
+                target = chat_id or sender_id
+                if value in {"run-cancel", "stop-cancel"}:
+                    await self._render_screen(target, "scan", source_message=message, reason="cancel")
+                    return
+                if value == "run":
+                    if self.start_scan():
+                        lifecycle = getattr(self, "lifecycle", None)
+                        current_message_id = message_id or (lifecycle.session(target).message_id if lifecycle else None)
+                        if current_message_id:
+                            self.remember_scan_message(target, current_message_id)
+                    await self._render_screen(target, "scan", source_message=message, reason="scan-start")
+                    return
+                if value == "retry":
+                    self.start_scan("retry")
+                    await self._render_screen(target, "scan", source_message=message, reason="scan-retry")
+                    return
+                if value == "status":
+                    await self._render_screen(target, "scan", source_message=message, reason="progress")
+                    return
+                if value == "stop":
+                    if not self.scan_is_running():
+                        await self._render_screen(target, "scan", source_message=message, reason="scan-finished")
+                        return
+                    await self._show_screen(
+                        target,
+                        "scan",
+                        "⏹ Остановить текущую проверку? Уже обработанные документы сохранятся.",
+                        {"inline_keyboard": [[
+                            {"text": "⏹ Да, остановить", "callback_data": telegram_keyboards.encode_callback("scan", "stop-confirm")},
+                            {"text": "Отмена", "callback_data": telegram_keyboards.encode_callback("scan", "stop-cancel")},
+                        ]]},
+                        source_message=message,
+                        reason="confirmation",
+                    )
+                    return
+                if value == "stop-confirm":
+                    self.stop_scan()
+                    await self._render_screen(target, "scan", source_message=message, reason="scan-stop")
+                    return
             if action == "settings":
                 if value.startswith("set-"):
                     mode = value.removeprefix("set-")
@@ -872,6 +1019,19 @@ class TelegramBot:
                 return
             result = await asyncio.to_thread(self.toggle_user_ignored_category, sender_id, data[2])
             await reply(result or "Категория не найдена — откройте раздел заново.", fallback_chat_id=sender.get("id"))
+            return
+        if decoded and decoded[0] in {"ignore", "userignore"}:
+            action, token = decoded
+            user_id = sender_id if action == "userignore" else None
+            if action == "userignore":
+                with SessionLocal() as session:
+                    user = session.get(UserAccess, user_id) if user_id else None
+                if not is_allowed(user):
+                    return
+                result = await asyncio.to_thread(self.toggle_user_ignored_category, user_id, token)
+            else:
+                result = await asyncio.to_thread(self.toggle_ignored_category, token)
+            await reply(result or "Категория не найдена — откройте фильтры заново.")
             return
         if not is_admin(sender_id, settings.telegram_admin_id):
             return
@@ -1019,6 +1179,10 @@ class TelegramBot:
         text = (message.get("text") or "").strip()
         if not chat_id or not text:
             return
+        lifecycle = getattr(self, "lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.remember_context_message(chat_id, message)
+            await lifecycle.cleanup_trigger_message(chat_id, message)
         sender_id = sender.get("id")
         if (not is_admin(sender_id, settings.telegram_admin_id)
                 and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
@@ -1065,17 +1229,24 @@ class TelegramBot:
                         chat_id,
                         "scan",
                         "🔍 Запустить полную проверку каталога ФСТЭК сейчас?",
-                        {"inline_keyboard": [[
-                            {"text": "▶️ Запустить", "callback_data": "scan:run:confirm"},
-                            {"text": "✕ Отмена", "callback_data": "scan:run:cancel"},
-                        ], [{"text": "🏠 Главное меню", "callback_data": "menu:main"}]]},
+                        telegram_keyboards.scan_confirmation_keyboard(),
                         reset=True,
                     )
             elif command == "/settings":
                 await self._render_screen(chat_id, "settings", reset=True)
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
-            await self.send_temporary(chat_id, "Не удалось выполнить команду. Ошибка записана и отправлена администратору.", ttl=15)
+            await self._show_screen(
+                chat_id,
+                "error",
+                "⚠️ Не удалось выполнить действие.\nОшибка записана в журнал.",
+                {"inline_keyboard": [[
+                    {"text": "🔁 Повторить", "callback_data": telegram_keyboards.encode_callback("screen", "help")},
+                    {"text": "🏠 Главное меню", "callback_data": telegram_keyboards.encode_callback("menu", "main")},
+                ]]},
+                reset=True,
+                reason="error",
+            )
         finally:
             log.info("command %s took %.2fs", command, time.monotonic() - started_at)
 

@@ -14,6 +14,7 @@ class FakeTransport:
         self.edited: list[tuple[int, int, str, dict | None]] = []
         self.deleted: list[tuple[int, int]] = []
         self.fail_next_edit: Exception | None = None
+        self.markup_edits: list[tuple[int, int, dict | None]] = []
 
     async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int:
         self.next_message_id += 1
@@ -28,6 +29,9 @@ class FakeTransport:
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
+
+    async def edit_message_reply_markup(self, chat_id: int, message_id: int, reply_markup=None) -> None:
+        self.markup_edits.append((chat_id, message_id, reply_markup))
 
 
 def test_screen_transitions_edit_one_reusable_message() -> None:
@@ -119,5 +123,71 @@ def test_concurrent_screen_updates_are_serialized() -> None:
 
         assert len(transport.sent) == 1
         assert len(transport.edited) == 1
+
+    asyncio.run(scenario())
+
+
+def test_five_navigation_transitions_reuse_one_tail_message() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+
+        for screen in ("main", "status", "settings", "filters", "changes"):
+            await lifecycle.show_screen(7, screen, screen, {"inline_keyboard": []})
+
+        assert len(transport.sent) == 1
+        assert len(transport.edited) == 4
+        assert lifecycle.session(7).message_id == 101
+
+    asyncio.run(scenario())
+
+
+def test_stale_tail_creates_one_new_screen_instead_of_editing_history() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        await lifecycle.show_screen(7, "main", "main", None)
+        lifecycle.remember_message(7, 102, context=True)
+
+        await lifecycle.show_screen(7, "settings", "settings", None)
+
+        assert len(transport.edited) == 0
+        assert len(transport.sent) == 2
+        assert transport.deleted == [(7, 101)]
+
+    asyncio.run(scenario())
+
+
+def test_media_trigger_is_never_deleted_and_menu_is_recreated_below_it() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        await lifecycle.show_screen(7, "main", "main", None)
+        lifecycle.remember_message(7, 102, context=True)
+
+        await lifecycle.show_screen(
+            7,
+            "changes",
+            "changes",
+            None,
+            source_message={"message_id": 102, "document": {"file_id": "x"}},
+        )
+
+        assert (7, 102) not in transport.deleted
+        assert transport.markup_edits == [(7, 102, {"inline_keyboard": []})]
+        assert len(transport.sent) == 2
+
+    asyncio.run(scenario())
+
+
+def test_temporary_message_is_tracked_separately_from_screen() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        temporary = await lifecycle.show_temporary(7, "toast", ttl=0.01)
+
+        assert temporary in lifecycle.session(7).temporary_message_ids
+        await asyncio.sleep(0.02)
+        assert (7, temporary) in transport.deleted
 
     asyncio.run(scenario())
