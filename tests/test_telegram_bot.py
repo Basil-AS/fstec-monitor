@@ -256,6 +256,41 @@ def test_settings_callback_changes_mode_and_confirms(monkeypatch):
     assert any("Расписание изменено" in args[1] for args in sent)
 
 
+def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.notifications_enabled = lambda: True
+    bot.set_notifications_enabled = lambda enabled: setattr(bot, "saved_enabled", enabled)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return {}
+
+    async def render(*args, **kwargs):
+        calls.append(("render", args, kwargs))
+        return 42
+
+    bot.call = call
+    bot._render_screen = render
+
+    asyncio.run(bot.handle_callback({
+        "id": "callback-settings",
+        "from": {"id": 151599744},
+        "message": {"message_id": 42, "chat": {"id": 151599744}},
+        "data": "v1:settings:notifications",
+    }))
+
+    assert bot.saved_enabled is False
+    assert calls[0] == ("answerCallbackQuery", {
+        "callback_query_id": "callback-settings",
+        "text": "Сохраняю настройки…",
+    })
+    assert calls[1][0] == "render"
+    assert all(item[0] != "sendMessage" for item in calls if item[0] != "render")
+
+
 def test_run_does_not_start_scan_immediately(monkeypatch):
     class StopRun(Exception):
         pass
