@@ -41,6 +41,9 @@ from .telegram.callbacks import decode_callback
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
 from .telegram.rendering import has_html_markup, render_scan_progress
+from .telegram.ux.callbacks import CallbackCodec
+from .telegram.ux.messages import MessageLedger
+from .telegram.ux.models import ViewModel
 
 log = logging.getLogger(__name__)
 MEANINGFUL_KINDS = {
@@ -173,6 +176,9 @@ class TelegramBot:
         self.schedule_mode: str | None = None
         self.client = httpx.AsyncClient(timeout=40)
         self.lifecycle = MessageLifecycleManager(self)
+        # UX toolkit façade: lifecycle remains the single source of truth.
+        self.ux = MessageLedger(self.lifecycle)
+        self.ux_callbacks = CallbackCodec(namespace="ux")
         self.progress_coalescer = ProgressCoalescer(self._refresh_progress_screen, interval=2.0)
         self.navigation: dict[int, NavigationStack] = {}
         self.last_error_notice = 0.0
@@ -795,11 +801,9 @@ class TelegramBot:
         lifecycle = getattr(self, "lifecycle", None)
         if lifecycle is None:
             return await self.send(chat_id, text, markup)
-        return await lifecycle.show_screen(
+        return await self.ux.edit_or_send_menu(
             chat_id,
-            screen,
-            text,
-            markup,
+            ViewModel(screen, text, markup, payload=payload),
             source_message=source_message,
             reason=reason,
         )
