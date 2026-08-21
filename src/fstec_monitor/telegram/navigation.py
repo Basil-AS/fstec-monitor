@@ -14,24 +14,31 @@ class Screen:
 
 @dataclass
 class NavigationStack:
-    _screens: list[str] = field(default_factory=list)
+    _screens: list[tuple[str, object | None]] = field(default_factory=list)
 
     @property
     def current(self) -> str:
-        return self._screens[-1] if self._screens else "main"
+        return self._screens[-1][0] if self._screens else "main"
+
+    @property
+    def current_payload(self) -> object | None:
+        return self._screens[-1][1] if self._screens else None
 
     def reset(self, screen: str = "main") -> None:
-        self._screens[:] = [screen]
+        self._screens[:] = [(screen, None)]
 
     def push(self, screen: str, payload: object | None = None) -> None:
-        del payload
-        if self.current != screen:
-            self._screens.append(screen)
+        if not self._screens or self.current != screen or self.current_payload != payload:
+            self._screens.append((screen, payload))
 
     def back(self) -> str:
         if len(self._screens) > 1:
             self._screens.pop()
         return self.current
+
+    def back_frame(self) -> tuple[str, object | None]:
+        self.back()
+        return self.current, self.current_payload
 
 
 def _button(text: str, section: str, action: str) -> dict:
