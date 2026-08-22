@@ -310,9 +310,12 @@ class ProgressCoalescer:
             self._first_render = False
             value = self._latest
             self._latest = None
-            result = self.renderer(value)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = self.renderer(value)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                log.warning("progress update failed; the next update may recover it", exc_info=True)
 
     async def close(self) -> None:
         self._closed = True

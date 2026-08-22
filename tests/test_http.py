@@ -23,7 +23,7 @@ def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
     fetcher = Fetcher.__new__(Fetcher)
     fetcher.client = FailingClient()
 
-    with pytest.raises(RuntimeError, match="failed to fetch"):
+    with pytest.raises(RuntimeError, match="failed to fetch .* after 2 attempts: ReadTimeout"):
         asyncio.run(fetcher.get("https://example.test"))
 
     assert sleeps == [0, 5, 0]
