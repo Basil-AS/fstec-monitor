@@ -20,10 +20,46 @@ from .storage import ObjectStore, StorageQuotaExceeded
 
 log = logging.getLogger(__name__)
 REMOVAL_CONFIRMATION_RUNS = 2
+ATTACHMENT_SUFFIXES = (".odt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".zip", ".rar", ".7z")
 
 
 def category_key(value: str) -> str:
     return " ".join(value.replace("\xa0", " ").split()).casefold()
+
+
+def attachment_group_key(link) -> str:
+    """Return a stable title key shared by ODT/PDF variants."""
+    title = category_key(link.title or "")
+    for suffix in ATTACHMENT_SUFFIXES:
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].rstrip(" ._-\u2013\u2014")
+            break
+    if title:
+        return title
+    path_name = urlparse(link.url).path.rsplit("/", 1)[-1].casefold()
+    for suffix in ATTACHMENT_SUFFIXES:
+        if path_name.endswith(suffix):
+            path_name = path_name[: -len(suffix)]
+            break
+    return path_name
+
+
+def preferred_attachment_urls(attachments) -> set[str]:
+    """Choose one comparison source per attachment title, preferring ODT."""
+    groups: dict[str, list] = {}
+    for link in attachments:
+        groups.setdefault(attachment_group_key(link), []).append(link)
+    selected: set[str] = set()
+    for links in groups.values():
+        selected_link = next(
+            (link for link in links if urlparse(link.url).path.casefold().endswith(".odt")),
+            next(
+                (link for link in links if urlparse(link.url).path.casefold().endswith(".pdf")),
+                links[0],
+            ),
+        )
+        selected.add(selected_link.url)
+    return selected
 
 
 def ignored_category_keys() -> set[str]:
@@ -180,13 +216,22 @@ class Monitor:
                 if a.url not in active_urls and a.active:
                     a.active=False
                     if not baseline:self.event(s,doc,"attachment_removed","warning",f"удалено вложение: {a.display_name}",a.url)
-            audit_attachments = previous is None or previous.semantic_sha256 != text_hash or audit_due
+            # Attachment content is the actual change source. Recheck the
+            # preferred ODT/PDF variant on every document fetch; binary hashes
+            # make unchanged files cheap while avoiding stale attachment data.
+            audit_attachments = True
+            preferred_urls = preferred_attachment_urls(parsed.attachments)
             for link in parsed.attachments:
                 att=s.scalar(select(Attachment).where(Attachment.document_id==doc.id,Attachment.url==link.url))
                 if not att:
                     att=Attachment(document_id=doc.id,url=link.url,display_name=link.title); s.add(att); s.flush()
-                    if not baseline:self.event(s,doc,"attachment_added","warning",f"добавлено вложение: {link.title}",link.url)
+                    # A new document already explains the attachment. Emitting
+                    # one more event per format produced misleading floods.
+                    if not baseline and not is_new:
+                        self.event(s,doc,"attachment_added","warning",f"добавлено вложение: {link.title}",link.url)
                 att.active=True; att.last_seen_at=datetime.now(UTC); att.display_name=link.title
+                if link.url not in preferred_urls:
+                    continue
                 if audit_attachments or not s.scalar(select(AttachmentVersion.id).where(AttachmentVersion.attachment_id==att.id).limit(1)):
                     try:
                         await self.process_attachment(s,doc,att,baseline)
@@ -211,7 +256,7 @@ class Monitor:
         s.add(AttachmentVersion(attachment_id=att.id,status_code=r.status_code,content_type=r.headers.get("content-type",""),content_length=len(data),binary_sha256=digest,semantic_sha256=sem,object_key=key,extracted_text_key=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
         if previous and not baseline:
             same=bool(sem and sem==previous.semantic_sha256)
-            self.event(s,doc,"attachment_binary_changed" if same else "attachment_content_changed","info" if same else "critical",f"заменено вложение: {att.display_name}",f"{att.url}\nold={previous.binary_sha256}\nnew={digest}\nsemantic_same={same}")
+            self.event(s,doc,"attachment_binary_changed" if same else "attachment_content_changed","info" if same else "critical",f"обновлено вложение: {att.display_name}",f"{att.url}\nold={previous.binary_sha256}\nnew={digest}\nsemantic_same={same}")
 
 def PathSuffix(url,ctype):
     p=urlparse(url).path.lower()

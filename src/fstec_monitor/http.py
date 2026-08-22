@@ -33,4 +33,8 @@ class Fetcher:
                 last=e
                 if attempt + 1 < settings.max_retries:
                     await asyncio.sleep(min(60, 5*(2**attempt)))
-        raise RuntimeError(f"failed to fetch {url}: {last}")
+        if last is None:
+            detail = "unknown transport error"
+        else:
+            detail = f"{type(last).__name__}: {last}".rstrip()
+        raise RuntimeError(f"failed to fetch {url} after {settings.max_retries} attempts: {detail}") from last

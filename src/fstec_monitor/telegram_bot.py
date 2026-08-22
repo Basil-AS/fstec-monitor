@@ -465,7 +465,7 @@ class TelegramBot:
             lifecycle.adopt_screen(chat_id, message_id, "scan")
             try:
                 await lifecycle.show_progress(chat_id, text, markup)
-            except (OSError, RuntimeError, TimeoutError) as exc:
+            except (OSError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
                 log.debug("scan status message cannot be updated: %s", exc)
             return
         try:
@@ -581,7 +581,33 @@ class TelegramBot:
                 .limit(max(1, min(limit, 30)))
             ).all()
             docs = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))).all()}
-        return "\n".join(f"#{e.id} {_dt(e.created_at)} {e.kind}: {docs.get(e.document_id).title if docs.get(e.document_id) else e.summary}" for e in events) or "Изменений нет."
+        if not events:
+            return "Изменений нет."
+        lines = ["📰 Последние изменения"]
+        grouped: dict[tuple[str, int | None], list[Event]] = {}
+        for event in events:
+            document = docs.get(event.document_id) if event.document_id else None
+            category = document.category if document and document.category else "Без категории"
+            grouped.setdefault((category, event.document_id), []).append(event)
+        for (category, document_id), grouped_events in grouped.items():
+            document = docs.get(document_id) if document_id else None
+            title = document.title if document else "Общие события"
+            lines.append(f"\n📁 {category}\n<b>{title}</b>")
+            ordered = sorted(grouped_events, key=lambda event: (event.kind != "document_added", event.id))
+            for event in ordered:
+                lines.append(f"• #{event.id} {_dt(event.created_at)} — {event.summary}")
+        lines.append("\nДля полного Markdown-отчёта: /report (без ID — последнее событие).")
+        return "\n".join(lines)
+
+    @staticmethod
+    def latest_change_id() -> int | None:
+        with SessionLocal() as session:
+            return session.scalar(
+                select(Event.id)
+                .where(Event.kind.in_(MEANINGFUL_KINDS))
+                .order_by(Event.id.desc())
+                .limit(1)
+            )
 
     def changes_page(self, page: int = 0, page_size: int = 5) -> tuple[str, list[list[dict]]]:
         page_size = max(1, min(page_size, 10))
@@ -1141,6 +1167,10 @@ class TelegramBot:
                 return None
             doc = session.get(Document, event.document_id) if event.document_id else None
             report = event_report_md(event, doc.title if doc else "", doc.canonical_url if doc else "")
+            report_path = Path(settings.storage_dir) / "reports" / f"event-{event.id}.md"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report, encoding="utf-8")
+            log.info("persisted Markdown report event=%s path=%s", event.id, report_path)
             hashes = re.findall(r"(?:old|new)=([0-9a-f]{64})", event.details)
             if hashes:
                 versions = session.scalars(select(AttachmentVersion).where(AttachmentVersion.binary_sha256.in_(hashes))).all()
@@ -1208,10 +1238,11 @@ class TelegramBot:
             elif command in {"/changes", "/events"}:
                 await self._render_screen(chat_id, "changes", reset=True)
             elif command in {"/report", "/diff"}:
-                if len(parts) != 2 or not parts[1].isdigit():
-                    await self.send(chat_id, f"Использование: {command} ID")
+                event_id = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else await asyncio.to_thread(self.latest_change_id)
+                if event_id is None:
+                    await self.send(chat_id, "Изменений для отчёта пока нет.")
                 else:
-                    await self.send_report(chat_id, int(parts[1]))
+                    await self.send_report(chat_id, event_id)
             elif command == "/errors":
                 await self._render_screen(chat_id, "errors", reset=True)
             elif command == "/clear_errors":

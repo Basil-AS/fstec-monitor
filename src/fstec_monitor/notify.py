@@ -21,16 +21,34 @@ def format_event(e: Event, document_url: str = "") -> str:
 
 
 def format_change_digest(events: list[Event], documents: dict[int, Document]) -> str:
-    lines = [f"🔔 Изменения ФСТЭК: {len(events)} событий"]
-    for event in events[:20]:
-        icon = {"critical": "🔴", "warning": "🟠", "info": "🔵"}.get(event.severity, "⚪")
+    grouped: dict[tuple[str, int | None], list[Event]] = {}
+    for event in events:
         document = documents.get(event.document_id) if event.document_id else None
-        link = ""
-        if document:
-            link = f' · <a href="{escape(document.canonical_url, quote=True)}">открыть</a>'
-        lines.append(f"{icon} <b>{escape(event.summary[:240])}</b> <code>{escape(event.kind)}</code>{link}")
-    if len(events) > 20:
-        lines.append(f"… и ещё {len(events) - 20}. Подробности: /changes")
+        category = getattr(document, "category", "") if document else ""
+        category = category or "Без категории"
+        grouped.setdefault((category, event.document_id), []).append(event)
+
+    # A new document and its initial ODT/PDF links are one user-visible fact.
+    # Keep the document event and suppress redundant attachment_added children.
+    visible_groups: list[tuple[tuple[str, int | None], list[Event]]] = []
+    for key, group in grouped.items():
+        has_document_added = any(event.kind == "document_added" for event in group)
+        if has_document_added:
+            group = [event for event in group if event.kind != "attachment_added"]
+        if group:
+            visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
+
+    lines = [f"🔔 Изменения ФСТЭК: {sum(len(group) for _, group in visible_groups)} событий"]
+    for (category, document_id), group in visible_groups[:20]:
+        document = documents.get(document_id) if document_id else None
+        title = getattr(document, "title", "") if document else "Общие события"
+        link = f' · <a href="{escape(document.canonical_url, quote=True)}">открыть</a>' if document else ""
+        lines.append(f"\n📁 <b>{escape(category)}</b>\n<b>{escape(title)}</b>")
+        for event in group:
+            icon = {"critical": "🔴", "warning": "🟠", "info": "🔵"}.get(event.severity, "⚪")
+            lines.append(f"{icon} {escape(event.summary[:240])} <code>{escape(event.kind)}</code>{link}")
+    if len(visible_groups) > 20:
+        lines.append(f"… и ещё {len(visible_groups) - 20} документов. Подробности: /changes")
     return "\n".join(lines)
 
 

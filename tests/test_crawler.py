@@ -6,7 +6,12 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from fstec_monitor import crawler
-from fstec_monitor.crawler import Monitor, category_key, snapshot_required
+from fstec_monitor.crawler import (
+    Monitor,
+    category_key,
+    preferred_attachment_urls,
+    snapshot_required,
+)
 from fstec_monitor.models import Base, Document, Event, ScanRun, Snapshot
 
 
@@ -19,6 +24,19 @@ def test_markup_only_change_does_not_require_semantic_change():
     assert not snapshot_required("same", "same", True)
     assert snapshot_required("old", "new", True)
     assert snapshot_required("", "new", False)
+
+
+def test_preferred_attachment_source_chooses_odt_over_pdf():
+    links = [
+        SimpleNamespace(url="https://example.test/report.pdf", title="Report"),
+        SimpleNamespace(url="https://example.test/report.odt", title="Report"),
+    ]
+    assert preferred_attachment_urls(links) == {"https://example.test/report.odt"}
+
+
+def test_preferred_attachment_source_falls_back_to_pdf():
+    link = SimpleNamespace(url="https://example.test/report.pdf", title="Report")
+    assert preferred_attachment_urls([link]) == {link.url}
 
 
 _HTML = """<html><body><article><h1>Doc</h1><p>Content line</p>
@@ -57,6 +75,24 @@ def test_unchanged_document_does_not_create_new_snapshot(monkeypatch, tmp_path):
     asyncio.run(run())
     with session_factory() as session:
         assert session.scalar(select(func.count(Snapshot.id))) == 1
+
+
+def test_new_document_emits_one_document_event_not_attachment_flood(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/new-events.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = _FakeFetcher(_HTML)
+        await monitor.process_document("https://fstec.ru/dokumenty/vse-dokumenty/cat/doc", baseline=False)
+
+    asyncio.run(run())
+    with session_factory() as session:
+        kinds = [event.kind for event in session.scalars(select(Event)).all()]
+        assert kinds == ["document_added"]
 
 
 def test_changed_document_creates_new_snapshot(monkeypatch, tmp_path):
