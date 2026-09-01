@@ -14,6 +14,7 @@ from fstec_monitor.crawler import (
     category_key,
     preferred_attachment_urls,
     release_scan_lock,
+    scan_concurrency,
     snapshot_required,
 )
 from fstec_monitor.models import (
@@ -39,6 +40,13 @@ def test_scan_lock_rejects_a_second_process(monkeypatch, tmp_path):
             acquire_scan_lock()
     finally:
         release_scan_lock(first)
+
+
+def test_sqlite_scans_use_one_document_worker(monkeypatch):
+    monkeypatch.setattr(crawler.settings, "database_url", "sqlite:///scan.db")
+    monkeypatch.setattr(crawler.settings, "max_concurrency", 8)
+
+    assert scan_concurrency() == 1
 
 
 def test_scan_history_failure_is_logged(monkeypatch, caplog):
