@@ -926,6 +926,90 @@ class TelegramBot:
             return "Открываю…"
         return "Обновлено"
 
+    async def _dispatch_decoded_callback(
+        self,
+        action: str,
+        value: str,
+        chat_id: int | None,
+        sender_id: int | None,
+        message: dict,
+        message_id: int | None,
+        reply,
+    ) -> bool:
+        """Handle namespaced navigation/scan/settings callbacks."""
+        if action == "menu" and value == "main":
+            await self._render_screen(chat_id or sender_id, "main", reset=True, source_message=message)
+            return True
+        if action == "nav" and value == "back":
+            stack = self._navigation_stack(chat_id or sender_id)
+            await self._render_screen(chat_id or sender_id, stack.back(), reset=True, source_message=message, reason="back")
+            return True
+        if action == "screen":
+            if value.startswith("changes-page-"):
+                page = value.removeprefix("changes-page-")
+                if page.isdigit():
+                    stack = self._navigation_stack(chat_id or sender_id)
+                    stack.replace("changes", {"page": int(page)})
+                    await self._render_screen(chat_id or sender_id, "changes", source_message=message, payload={"page": int(page)})
+                return True
+            await self._render_screen(chat_id or sender_id, value, source_message=message)
+            return True
+        if action == "scan":
+            target = chat_id or sender_id
+            if value in {"run-cancel", "stop-cancel"}:
+                await self._render_screen(target, "scan", source_message=message, reason="cancel")
+                return True
+            if value == "run":
+                if self.start_scan():
+                    lifecycle = getattr(self, "lifecycle", None)
+                    current_message_id = message_id or (lifecycle.session(target).message_id if lifecycle else None)
+                    if current_message_id:
+                        self.remember_scan_message(target, current_message_id)
+                await self._render_screen(target, "scan", source_message=message, reason="scan-start")
+                return True
+            if value == "retry":
+                self.start_scan("retry")
+                await self._render_screen(target, "scan", source_message=message, reason="scan-retry")
+                return True
+            if value == "status":
+                await self._render_screen(target, "scan", source_message=message, reason="progress")
+                return True
+            if value == "stop":
+                if not self.scan_is_running():
+                    await self._render_screen(target, "scan", source_message=message, reason="scan-finished")
+                    return True
+                await self._show_screen(
+                    target,
+                    "scan",
+                    "⏹ Остановить текущую проверку? Уже обработанные документы сохранятся.",
+                    {"inline_keyboard": [[
+                        {"text": "⏹ Да, остановить", "callback_data": telegram_keyboards.encode_callback("scan", "stop-confirm")},
+                        {"text": "Отмена", "callback_data": telegram_keyboards.encode_callback("scan", "stop-cancel")},
+                    ]]},
+                    source_message=message,
+                    reason="confirmation",
+                )
+                return True
+            if value == "stop-confirm":
+                self.stop_scan()
+                await self._render_screen(target, "scan", source_message=message, reason="scan-stop")
+                return True
+        if action == "settings":
+            if value.startswith("set-"):
+                mode = value.removeprefix("set-")
+                try:
+                    self.set_schedule_mode(mode)
+                except ValueError:
+                    await reply("Неизвестный режим расписания.")
+                    return True
+                await self._render_screen(chat_id or sender_id, "settings", reset=True)
+                return True
+            if value == "notifications":
+                self.set_notifications_enabled(not self.notifications_enabled())
+                await self._render_screen(chat_id or sender_id, "settings", reset=True)
+                return True
+        return False
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -993,77 +1077,10 @@ class TelegramBot:
                     user = session.get(UserAccess, sender_id) if sender_id else None
                 if not is_allowed(user):
                     return
-            if action == "menu" and value == "main":
-                await self._render_screen(chat_id or sender_id, "main", reset=True, source_message=message)
+            if await self._dispatch_decoded_callback(
+                action, value, chat_id, sender_id, message, message_id, reply
+            ):
                 return
-            if action == "nav" and value == "back":
-                stack = self._navigation_stack(chat_id or sender_id)
-                await self._render_screen(chat_id or sender_id, stack.back(), reset=True, source_message=message, reason="back")
-                return
-            if action == "screen":
-                if value.startswith("changes-page-"):
-                    page = value.removeprefix("changes-page-")
-                    if page.isdigit():
-                        stack = self._navigation_stack(chat_id or sender_id)
-                        stack.replace("changes", {"page": int(page)})
-                        await self._render_screen(chat_id or sender_id, "changes", source_message=message, payload={"page": int(page)})
-                    return
-                await self._render_screen(chat_id or sender_id, value, source_message=message)
-                return
-            if action == "scan":
-                target = chat_id or sender_id
-                if value in {"run-cancel", "stop-cancel"}:
-                    await self._render_screen(target, "scan", source_message=message, reason="cancel")
-                    return
-                if value == "run":
-                    if self.start_scan():
-                        lifecycle = getattr(self, "lifecycle", None)
-                        current_message_id = message_id or (lifecycle.session(target).message_id if lifecycle else None)
-                        if current_message_id:
-                            self.remember_scan_message(target, current_message_id)
-                    await self._render_screen(target, "scan", source_message=message, reason="scan-start")
-                    return
-                if value == "retry":
-                    self.start_scan("retry")
-                    await self._render_screen(target, "scan", source_message=message, reason="scan-retry")
-                    return
-                if value == "status":
-                    await self._render_screen(target, "scan", source_message=message, reason="progress")
-                    return
-                if value == "stop":
-                    if not self.scan_is_running():
-                        await self._render_screen(target, "scan", source_message=message, reason="scan-finished")
-                        return
-                    await self._show_screen(
-                        target,
-                        "scan",
-                        "⏹ Остановить текущую проверку? Уже обработанные документы сохранятся.",
-                        {"inline_keyboard": [[
-                            {"text": "⏹ Да, остановить", "callback_data": telegram_keyboards.encode_callback("scan", "stop-confirm")},
-                            {"text": "Отмена", "callback_data": telegram_keyboards.encode_callback("scan", "stop-cancel")},
-                        ]]},
-                        source_message=message,
-                        reason="confirmation",
-                    )
-                    return
-                if value == "stop-confirm":
-                    self.stop_scan()
-                    await self._render_screen(target, "scan", source_message=message, reason="scan-stop")
-                    return
-            if action == "settings":
-                if value.startswith("set-"):
-                    mode = value.removeprefix("set-")
-                    try:
-                        self.set_schedule_mode(mode)
-                    except ValueError:
-                        await reply("Неизвестный режим расписания.")
-                        return
-                    await self._render_screen(chat_id or sender_id, "settings", reset=True)
-                    return
-                if value == "notifications":
-                    self.set_notifications_enabled(not self.notifications_enabled())
-                    await self._render_screen(chat_id or sender_id, "settings", reset=True)
-                    return
         if len(data) == 3 and data[0] == "userignore" and data[1] == "t":
             with SessionLocal() as session:
                 user = session.get(UserAccess, sender_id) if sender_id else None
