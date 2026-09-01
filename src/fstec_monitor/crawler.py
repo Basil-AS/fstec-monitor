@@ -266,6 +266,25 @@ def PathSuffix(url,ctype):
     if "opendocument" in ctype:return ".odt"
     return ".bin"
 
+
+def persist_scan_run(*, started, finished, documents: int, trigger: str, baseline: bool, error: str) -> None:
+    """Persist scan history without hiding database failures from operators."""
+    try:
+        with SessionLocal() as s:
+            s.add(ScanRun(
+                started_at=started,
+                finished_at=finished,
+                documents=documents,
+                trigger=trigger,
+                baseline=baseline,
+                error=error,
+            ))
+            s.commit()
+    except SQLAlchemyError:
+        # History is auxiliary and must not change the scan result, but a
+        # missing history row is operationally significant and must be visible.
+        log.exception("failed to persist scan history")
+
 async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=None,cancel_event=None):
     m=Monitor()
     urls=[]; error=""; started=datetime.now(UTC); completed=0; errors_count=0
@@ -320,11 +339,13 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
         raise
     finally:
         await m.close()
-        try:
-            with SessionLocal() as s:
-                s.add(ScanRun(started_at=started,finished_at=datetime.now(UTC),documents=len(urls),trigger=trigger,baseline=baseline,error=error))
-                s.commit()
-        except SQLAlchemyError:  # history must never break the scan itself
-            pass
+        persist_scan_run(
+            started=started,
+            finished=datetime.now(UTC),
+            documents=len(urls),
+            trigger=trigger,
+            baseline=baseline,
+            error=error,
+        )
         log.info("scan finished trigger=%s documents=%d error=%s", trigger, len(urls), bool(error))
     return len(urls)
