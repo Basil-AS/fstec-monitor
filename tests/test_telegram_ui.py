@@ -1,3 +1,6 @@
+import asyncio
+
+from fstec_monitor.config import settings
 from fstec_monitor.telegram.callbacks import decode_callback, encode_callback
 from fstec_monitor.telegram.keyboards import (
     admin_keyboard,
@@ -6,6 +9,7 @@ from fstec_monitor.telegram.keyboards import (
     user_keyboard,
 )
 from fstec_monitor.telegram.rendering import progress_bar, render_error_notice, render_scan_progress
+from fstec_monitor.telegram_bot import TelegramBot
 
 
 def _all_buttons(markup: dict) -> list[dict]:
@@ -54,3 +58,20 @@ def test_progress_and_error_rendering_are_bounded_and_redacted():
     notice = render_error_notice("polling", "secret-token-value")
     assert "secret-token-value" not in notice
     assert len(notice) < 300
+
+
+def test_help_command_renders_a_real_help_screen() -> None:
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.navigation = {}
+    sent: list[tuple[int, str, dict | None]] = []
+
+    async def send(chat_id: int, text: str, markup=None):
+        sent.append((chat_id, text, markup))
+        return 1
+
+    bot.send = send
+    asyncio.run(bot._render_screen(settings.telegram_admin_id, "help", reset=True))
+
+    assert len(sent) == 1
+    assert "Доступные команды" in sent[0][1]
+    assert "← Назад" in {button["text"] for button in _all_buttons(sent[0][2])}
