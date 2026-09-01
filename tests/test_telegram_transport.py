@@ -6,6 +6,15 @@ import logging
 from fstec_monitor.telegram_bot import TelegramBot
 
 
+def test_cli_suppresses_httpx_request_urls(monkeypatch) -> None:
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("httpx"), "level", logging.NOTSET)
+    import fstec_monitor.cli  # noqa: F401
+
+    assert logging.getLogger("httpx").level >= logging.WARNING
+
+
 def test_send_uses_html_only_for_explicit_markup_and_logs_metadata(monkeypatch, caplog) -> None:
     bot = TelegramBot.__new__(TelegramBot)
     calls = []
