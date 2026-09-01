@@ -21,13 +21,16 @@ class Fetcher:
     def __init__(self):
         self.client=httpx.AsyncClient(timeout=settings.timeout_seconds, follow_redirects=True, verify=settings.tls_verify, headers={"User-Agent": settings.user_agent, "Accept-Language":"ru-RU,ru;q=0.9"}, limits=httpx.Limits(max_connections=settings.max_concurrency, max_keepalive_connections=settings.max_concurrency))
     async def close(self): await self.client.aclose()
-    async def get(self,url:str, headers:dict[str, str] | None = None) -> httpx.Response:
+    async def get(self,url:str, headers:dict[str, str] | None = None, *, timeout: float | None = None) -> httpx.Response:
         last=None
         for attempt in range(settings.max_retries):
             try:
                 delay = settings.request_delay_seconds
                 await asyncio.sleep(delay + random.random() * delay)
-                r=await self.client.get(url, headers=headers)
+                request_kwargs = {"headers": headers}
+                if timeout is not None:
+                    request_kwargs["timeout"] = timeout
+                r=await self.client.get(url, **request_kwargs)
                 if r.status_code in {429,500,502,503,504}: raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
                 return r
             except (httpx.TransportError,httpx.HTTPStatusError) as e:
