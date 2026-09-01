@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     user_agent: str = "FSTEC-Monitor/0.1"
     request_delay_seconds: float = 2.0
     timeout_seconds: float = 45.0
+    attachment_timeout_seconds: float = 120.0
     max_retries: int = 3
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

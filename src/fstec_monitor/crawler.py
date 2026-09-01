@@ -245,7 +245,11 @@ class Monitor:
             s.commit()
     async def process_attachment(self,s,doc,att,baseline):
         previous=s.scalar(select(AttachmentVersion).where(AttachmentVersion.attachment_id==att.id).order_by(AttachmentVersion.id.desc()))
-        r=await self.fetcher.get(att.url, headers=conditional_headers(previous.etag, previous.last_modified) if previous else {})
+        r=await self.fetcher.get(
+            att.url,
+            headers=conditional_headers(previous.etag, previous.last_modified) if previous else {},
+            timeout=settings.attachment_timeout_seconds,
+        )
         if r.status_code==304:
             return
         r.raise_for_status(); data=r.content

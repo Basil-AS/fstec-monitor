@@ -50,3 +50,25 @@ def test_fetcher_jitter_is_bounded_by_configured_delay(monkeypatch):
     asyncio.run(fetcher.get("https://example.test"))
 
     assert sleeps == [1.0]
+
+
+def test_fetcher_accepts_a_per_request_timeout(monkeypatch):
+    seen = []
+
+    class SuccessfulClient:
+        async def get(self, *_args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return SimpleNamespace(status_code=200)
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("fstec_monitor.http.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("fstec_monitor.http.settings.request_delay_seconds", 0)
+    monkeypatch.setattr("fstec_monitor.http.settings.max_retries", 1)
+    fetcher = Fetcher.__new__(Fetcher)
+    fetcher.client = SuccessfulClient()
+
+    asyncio.run(fetcher.get("https://example.test", timeout=120.0))
+
+    assert seen == [120.0]

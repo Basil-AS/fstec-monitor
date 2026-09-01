@@ -78,7 +78,7 @@ class _FakeFetcher:
     def __init__(self, html: str):
         self.html = html
 
-    async def get(self, url, headers=None):
+    async def get(self, url, headers=None, **_kwargs):
         return SimpleNamespace(
             status_code=200, text=self.html, content=self.html.encode(),
             url=url, headers={}, raise_for_status=lambda: None,
