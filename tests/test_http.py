@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,3 +28,25 @@ def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
         asyncio.run(fetcher.get("https://example.test"))
 
     assert sleeps == [0, 5, 0]
+
+
+def test_fetcher_jitter_is_bounded_by_configured_delay(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    class SuccessfulClient:
+        async def get(self, *_args, **_kwargs):
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("fstec_monitor.http.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("fstec_monitor.http.random.random", lambda: 1)
+    monkeypatch.setattr("fstec_monitor.http.settings.request_delay_seconds", 0.5)
+    monkeypatch.setattr("fstec_monitor.http.settings.max_retries", 1)
+    fetcher = Fetcher.__new__(Fetcher)
+    fetcher.client = SuccessfulClient()
+
+    asyncio.run(fetcher.get("https://example.test"))
+
+    assert sleeps == [1.0]

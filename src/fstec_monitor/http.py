@@ -25,7 +25,8 @@ class Fetcher:
         last=None
         for attempt in range(settings.max_retries):
             try:
-                await asyncio.sleep(settings.request_delay_seconds + random.random())
+                delay = settings.request_delay_seconds
+                await asyncio.sleep(delay + random.random() * delay)
                 r=await self.client.get(url, headers=headers)
                 if r.status_code in {429,500,502,503,504}: raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
                 return r
