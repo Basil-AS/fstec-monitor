@@ -388,7 +388,11 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError
             async with semaphore:
-                try: await m.process_document(url,baseline)
+                try:
+                    await asyncio.wait_for(
+                        m.process_document(url, baseline),
+                        timeout=settings.document_timeout_seconds,
+                    )
                 except StorageQuotaExceeded as e:
                     errors_count += 1
                     log.warning("scan document failed url=%s error=%r", url, e)
