@@ -77,6 +77,33 @@ def test_unchanged_document_does_not_create_new_snapshot(monkeypatch, tmp_path):
         assert session.scalar(select(func.count(Snapshot.id))) == 1
 
 
+def test_recent_attachment_audit_is_not_repeated_for_unchanged_document(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/attachment-audit.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = _FakeFetcher(_HTML)
+        calls = 0
+        original_process_attachment = monitor.process_attachment
+
+        async def tracked_process_attachment(_session, _document, _attachment, _baseline):
+            nonlocal calls
+            calls += 1
+            return await original_process_attachment(_session, _document, _attachment, _baseline)
+
+        monitor.process_attachment = tracked_process_attachment
+        url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
+        await monitor.process_document(url, baseline=True)
+        await monitor.process_document(url)
+        return calls
+
+    assert asyncio.run(run()) == 1
+
+
 def test_new_document_emits_one_document_event_not_attachment_flood(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/new-events.db")
     Base.metadata.create_all(engine)
