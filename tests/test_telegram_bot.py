@@ -150,6 +150,26 @@ def test_temporary_message_is_deleted_after_ttl():
     assert calls[1] == ("deleteMessage", {"chat_id": 123, "message_id": 77})
 
 
+def test_pending_access_request_does_not_spam_user_on_repeated_updates(tmp_db):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append((args, kwargs))
+
+    bot.send = send
+    request = {"user_id": 42, "chat_id": 142, "username": "user", "display_name": "User"}
+
+    asyncio.run(bot.request_access(**request))
+    asyncio.run(bot.request_access(**request))
+
+    assert len(sent) == 2
+    assert sent[0][0][0] == telegram_bot_module.settings.telegram_admin_id
+    assert sent[1][0][0] == 142
+
+
 def test_only_configured_admin_is_authorized():
     assert is_admin(151599744, 151599744)
     assert not is_admin(151599745, 151599744)

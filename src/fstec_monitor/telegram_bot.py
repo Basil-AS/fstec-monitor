@@ -798,7 +798,8 @@ class TelegramBot:
                 if user:
                     user.notification_sent = True
                     session.commit()
-        await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения." if should_notify else "Ваша заявка уже ожидает решения администратора.")
+        if should_notify:
+            await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения.")
         return False
 
     def _navigation_stack(self, chat_id: int) -> NavigationStack:
