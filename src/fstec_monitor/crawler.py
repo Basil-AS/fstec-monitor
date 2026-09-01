@@ -302,9 +302,15 @@ class Monitor:
             s.commit()
     async def process_attachment(self,s,doc,att,baseline):
         previous=s.scalar(select(AttachmentVersion).where(AttachmentVersion.attachment_id==att.id).order_by(AttachmentVersion.id.desc()))
-        r=await self.fetcher.get(
-            att.url,
-            headers=conditional_headers(previous.etag, previous.last_modified) if previous else {},
+        # The configured attachment timeout is an overall deadline for the
+        # fetch, including retries.  Applying it only to each HTTP attempt
+        # lets a broken server hold a scan for several minutes per file.
+        r = await asyncio.wait_for(
+            self.fetcher.get(
+                att.url,
+                headers=conditional_headers(previous.etag, previous.last_modified) if previous else {},
+                timeout=settings.attachment_timeout_seconds,
+            ),
             timeout=settings.attachment_timeout_seconds,
         )
         if r.status_code==304:
@@ -385,6 +391,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
                 try: await m.process_document(url,baseline)
                 except StorageQuotaExceeded as e:
                     errors_count += 1
+                    log.warning("scan document failed url=%s error=%r", url, e)
                     with SessionLocal() as s:
                         s.add(Event(kind="storage_error", severity="critical", summary=f"квота хранилища достигнута при загрузке {url}", details=str(e))); s.commit()
                 except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
@@ -393,6 +400,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
                 finally:
                     completed += 1
+                    log.info("scan progress completed=%d/%d errors=%d", completed, len(urls), errors_count)
                     report("Проверка документов", completed, len(urls), errors_count)
         await gather_workers(process(url) for url in urls)
         if cancel_event and cancel_event.is_set():
