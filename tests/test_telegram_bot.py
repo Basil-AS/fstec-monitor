@@ -691,6 +691,38 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     assert "old-Doc.txt" in by_name and "new-Doc.txt" in by_name
 
 
+def test_report_without_id_uses_latest_meaningful_change(tmp_db):
+    with tmp_db() as session:
+        event = Event(
+            kind="attachment_content_changed",
+            severity="critical",
+            summary="обновлено вложение",
+        )
+        session.add(event)
+        session.commit()
+        event_id = event.id
+
+    bot = TelegramBot.__new__(TelegramBot)
+    reports = []
+
+    async def send_report(_chat_id, report_id):
+        reports.append(report_id)
+
+    bot.send_report = send_report
+    bot.send = lambda *_args, **_kwargs: None
+
+    import asyncio
+    asyncio.run(bot.handle({
+        "message": {
+            "from": {"id": 151599744},
+            "chat": {"id": 151599744},
+            "text": "/report",
+        }
+    }))
+
+    assert reports == [event_id]
+
+
 def test_scan_requires_confirmation_and_callback_starts_it():
     import asyncio
 
