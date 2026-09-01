@@ -17,6 +17,17 @@ def conditional_headers(etag: str = "", last_modified: str = "") -> dict[str, st
     return headers
 
 
+async def close_response(response) -> None:
+    """Close async HTTP streams without assuming a synchronous response."""
+    close_async = getattr(response, "aclose", None)
+    if close_async:
+        await close_async()
+        return
+    close_sync = getattr(response, "close", None)
+    if close_sync:
+        close_sync()
+
+
 class Fetcher:
     def __init__(self):
         self.client=httpx.AsyncClient(timeout=settings.timeout_seconds, follow_redirects=True, verify=settings.tls_verify, headers={"User-Agent": settings.user_agent, "Accept-Language":"ru-RU,ru;q=0.9"}, limits=httpx.Limits(max_connections=settings.max_concurrency, max_keepalive_connections=settings.max_concurrency))
@@ -36,13 +47,9 @@ class Fetcher:
                         r=await self.client.get(url, **request_kwargs)
                         if r.status_code in {429,500,502,503,504}:
                             error = httpx.HTTPStatusError("retryable", request=r.request, response=r)
-                            close = getattr(r, "close", None)
-                            if close:
-                                close()
+                            await close_response(r)
                             raise error
-                        close = getattr(r, "close", None)
-                        if close:
-                            close()
+                        await close_response(r)
                         return r
                     except (httpx.TransportError,httpx.HTTPStatusError) as e:
                         last=e
