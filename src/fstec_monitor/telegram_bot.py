@@ -1226,8 +1226,10 @@ class TelegramBot:
         if not is_admin(sender_id, settings.telegram_admin_id) and not is_user_command_allowed(command):
             await self.send(chat_id, "Доступно только получение обновлений и настройка личных категорий.")
             return
-        if command in {"/start", "/help"}:
+        if command == "/start":
             await self._render_screen(chat_id, "main", reset=True)
+        elif command == "/help":
+            await self._render_screen(chat_id, "help", reset=True)
         elif command == "/status":
             message_id = await self._render_screen(chat_id, "status", reset=True)
             if message_id and is_admin(sender_id, settings.telegram_admin_id) and self.scan_is_running():
