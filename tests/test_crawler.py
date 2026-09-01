@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,35 @@ from fstec_monitor.models import Base, Document, Event, ScanRun, Snapshot
 def test_category_key_normalizes_nbsp_and_case():
     assert category_key("Информационные и аналитические материалы  185") == "информационные и аналитические материалы 185"
     assert category_key("  Информационные   и аналитические материалы ") == "информационные и аналитические материалы"
+
+
+def test_scan_history_failure_is_logged(monkeypatch, caplog):
+    class FailingSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def add(self, _record):
+            raise crawler.SQLAlchemyError("history database unavailable")
+
+        def commit(self):
+            raise AssertionError("commit should not be reached")
+
+    monkeypatch.setattr(crawler, "SessionLocal", lambda: FailingSession())
+
+    with caplog.at_level("ERROR", logger="fstec_monitor.crawler"):
+        crawler.persist_scan_run(
+            started=datetime.now(UTC),
+            finished=datetime.now(UTC),
+            documents=1,
+            trigger="test",
+            baseline=False,
+            error="",
+        )
+
+    assert "failed to persist scan history" in caplog.text
 
 
 def test_markup_only_change_does_not_require_semantic_change():
