@@ -67,6 +67,35 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
+def test_notify_pending_splits_oversized_digest(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    document = Document(canonical_url="https://example.test/doc", title="Doc")
+    session.add(document)
+    session.flush()
+    session.add_all([
+        Event(
+            document_id=document.id,
+            kind="document_added",
+            severity="info",
+            summary=f"Документ {index} " + "x" * 240,
+        )
+        for index in range(30)
+    ])
+    session.commit()
+    _TelegramClient.calls = []
+    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+
+    sent = asyncio.run(notify_module.notify_pending(session))
+
+    assert sent == len(_TelegramClient.calls) > 1
+    assert all(len(call[1]["json"]["text"]) <= 4096 for call in _TelegramClient.calls)
+    assert len(session.scalars(select(EventDelivery)).all()) == 30
+    assert all(event.notified for event in session.scalars(select(Event)).all())
+
+
 def test_notify_pending_silences_an_already_delivered_error(monkeypatch, tmp_path):
     session = _session(tmp_path)
     session.add(Event(kind="fetch_error", severity="warning", summary="Сайт недоступен", notified=True))
