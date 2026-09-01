@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fstec_monitor.models import Document, Event
-from fstec_monitor.notify import format_change_digest
+from fstec_monitor.notify import _deduplicate_attachment_additions, format_change_digest
 
 
 def test_change_digest_groups_document_and_hides_initial_attachment_noise():
@@ -20,3 +20,17 @@ def test_change_digest_groups_document_and_hides_initial_attachment_noise():
     assert "добавлено вложение: Доклад.pdf" not in digest
     assert "добавлен документ: Доклад" in digest
     assert "обновлено вложение: Доклад.odt" in digest
+
+
+def test_change_digest_shows_one_added_event_for_pdf_and_odt_variants():
+    document = Document(id=8, canonical_url="https://example.test/doc", title="Доклад", category="Доклады")
+    events = [
+        Event(id=4, document_id=8, kind="attachment_added", severity="warning", summary="добавлено вложение: Доклад", details="https://example.test/report.pdf", created_at=datetime.now(UTC)),
+        Event(id=5, document_id=8, kind="attachment_added", severity="warning", summary="добавлено вложение: Доклад", details="https://example.test/report.odt", created_at=datetime.now(UTC)),
+    ]
+
+    digest = format_change_digest(events, {8: document})
+
+    assert digest.count("добавлено вложение: Доклад") == 1
+    selected = _deduplicate_attachment_additions(events)
+    assert selected[0].details.endswith("report.odt")
