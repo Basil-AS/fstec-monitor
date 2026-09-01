@@ -278,6 +278,22 @@ def test_run_monitor_records_scan_run(monkeypatch, tmp_path):
         assert run.error == ""
 
 
+def test_limited_scan_does_not_mark_unprocessed_documents_removed(monkeypatch, tmp_path):
+    session_factory = _scan_db(monkeypatch, tmp_path, lambda: _FakeMonitor(urls={"a", "b"}))
+    with session_factory() as session:
+        document = Document(canonical_url="b", title="Unprocessed", active=True)
+        session.add(document)
+        session.commit()
+
+    asyncio.run(crawler.run_monitor(limit=1, trigger="test"))
+
+    with session_factory() as session:
+        document = session.scalar(select(Document).where(Document.canonical_url == "b"))
+        assert document.active is True
+        assert document.missing_runs == 0
+        assert session.scalar(select(func.count(Event.id)).where(Event.kind == "document_removed")) == 0
+
+
 def test_run_monitor_reports_discovery_and_document_progress(monkeypatch, tmp_path):
     session_factory = _scan_db(monkeypatch, tmp_path, lambda: _FakeMonitor(urls={"a", "b"}))
     progress = []
