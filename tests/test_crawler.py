@@ -439,3 +439,22 @@ def test_run_monitor_records_failed_scan_run(monkeypatch, tmp_path):
         assert run is not None
         assert "catalog down" in run.error
         assert session.scalar(select(func.count(Event.id)).where(Event.kind == "fetch_error")) == 1
+
+
+def test_run_monitor_logs_url_for_isolated_document_failure(monkeypatch, tmp_path, caplog):
+    _scan_db(monkeypatch, tmp_path, None)
+    url = "https://example.test/broken-document"
+
+    class FailingMonitor(_FakeMonitor):
+        def __init__(self):
+            super().__init__(urls={url})
+
+        async def process_document(self, _url, baseline=False):
+            raise RuntimeError("document unavailable")
+
+    monkeypatch.setattr(crawler, "Monitor", FailingMonitor)
+    with caplog.at_level("WARNING", logger="fstec_monitor.crawler"):
+        asyncio.run(crawler.run_monitor(trigger="test"))
+
+    assert url in caplog.text
+    assert "document unavailable" in caplog.text
