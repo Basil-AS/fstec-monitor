@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import fcntl
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 
 from sqlalchemy import select
@@ -21,6 +23,27 @@ from .storage import ObjectStore, StorageQuotaExceeded
 log = logging.getLogger(__name__)
 REMOVAL_CONFIRMATION_RUNS = 2
 ATTACHMENT_SUFFIXES = (".odt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".zip", ".rar", ".7z")
+
+
+def _scan_lock_path() -> Path:
+    return Path(settings.storage_dir).resolve().parent / ".scan.lock"
+
+
+def acquire_scan_lock():
+    path = _scan_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RuntimeError("scan already running") from exc
+    return handle
+
+
+def release_scan_lock(handle) -> None:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
 
 
 def category_key(value: str) -> str:
@@ -359,6 +382,7 @@ def persist_scan_run(*, started, finished, documents: int, trigger: str, baselin
         log.exception("failed to persist scan history")
 
 async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=None,cancel_event=None):
+    scan_lock = acquire_scan_lock()
     m=Monitor()
     urls=[]; error=""; started=datetime.now(UTC); completed=0; errors_count=0
     def report(stage, done, total, errors):
@@ -423,6 +447,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
         raise
     finally:
         await m.close()
+        release_scan_lock(scan_lock)
         persist_scan_run(
             started=started,
             finished=datetime.now(UTC),

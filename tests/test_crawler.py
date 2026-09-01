@@ -10,8 +10,10 @@ from sqlalchemy.orm import sessionmaker
 from fstec_monitor import crawler
 from fstec_monitor.crawler import (
     Monitor,
+    acquire_scan_lock,
     category_key,
     preferred_attachment_urls,
+    release_scan_lock,
     snapshot_required,
 )
 from fstec_monitor.models import (
@@ -27,6 +29,16 @@ from fstec_monitor.models import (
 def test_category_key_normalizes_nbsp_and_case():
     assert category_key("Информационные и аналитические материалы  185") == "информационные и аналитические материалы 185"
     assert category_key("  Информационные   и аналитические материалы ") == "информационные и аналитические материалы"
+
+
+def test_scan_lock_rejects_a_second_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    first = acquire_scan_lock()
+    try:
+        with pytest.raises(RuntimeError, match="scan already running"):
+            acquire_scan_lock()
+    finally:
+        release_scan_lock(first)
 
 
 def test_scan_history_failure_is_logged(monkeypatch, caplog):
