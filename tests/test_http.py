@@ -72,3 +72,18 @@ def test_fetcher_accepts_a_per_request_timeout(monkeypatch):
     asyncio.run(fetcher.get("https://example.test", timeout=120.0))
 
     assert seen == [120.0]
+
+
+def test_fetcher_timeout_is_an_overall_deadline(monkeypatch):
+    monkeypatch.setattr("fstec_monitor.http.settings.request_delay_seconds", 0)
+    monkeypatch.setattr("fstec_monitor.http.settings.max_retries", 3)
+
+    class HangingClient:
+        async def get(self, *_args, **_kwargs):
+            await asyncio.sleep(60)
+
+    fetcher = Fetcher.__new__(Fetcher)
+    fetcher.client = HangingClient()
+
+    with pytest.raises(RuntimeError, match="overall timeout"):
+        asyncio.run(fetcher.get("https://example.test", timeout=0.01))
