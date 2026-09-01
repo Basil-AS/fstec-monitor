@@ -34,6 +34,22 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_help_command_dispatches_to_help_screen():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    rendered = []
+
+    async def render(chat_id, screen, **kwargs):
+        rendered.append((chat_id, screen, kwargs))
+        return 1
+
+    bot._render_screen = render
+    asyncio.run(bot._dispatch_command("/help", ["/help"], 151599744, 151599744))
+
+    assert rendered == [(151599744, "help", {"reset": True})]
+
+
 def test_edit_and_delete_message_use_telegram_native_methods():
     import asyncio
 
