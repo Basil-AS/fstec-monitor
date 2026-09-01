@@ -155,7 +155,7 @@ def category_key(value: str) -> str:
 
 
 def category_token(value: str) -> str:
-    return hashlib.sha1(category_key(value).encode()).hexdigest()[:16]
+    return hashlib.sha256(category_key(value).encode()).hexdigest()[:16]
 
 
 class TelegramBot:
