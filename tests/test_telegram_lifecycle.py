@@ -79,6 +79,23 @@ def test_missing_screen_message_is_recreated_without_losing_state() -> None:
     asyncio.run(scenario())
 
 
+def test_non_editable_screen_falls_back_to_new_menu_and_closes_old_one() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        await lifecycle.show_screen(7, "main", "Главное меню", {"inline_keyboard": []})
+        transport.fail_next_edit = RuntimeError("Bad Request: message can't be edited")
+
+        replacement = await lifecycle.show_screen(7, "settings", "Настройки", {"inline_keyboard": []})
+
+        assert replacement == 102
+        assert transport.deleted == [(7, 101)]
+        assert lifecycle.session(7).message_id == 102
+        assert lifecycle.session(7).screen == "settings"
+
+    asyncio.run(scenario())
+
+
 def test_persistent_message_is_not_deleted_by_screen_cleanup() -> None:
     async def scenario() -> None:
         transport = FakeTransport()
