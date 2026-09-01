@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from html import escape
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import select
@@ -21,6 +22,38 @@ def format_event(e: Event, document_url: str = "") -> str:
     return f"{icon} <b>ФСТЭК: {escape(e.summary)}</b>\n\n<code>{escape(e.kind)}</code>\n{escape(e.details[:3000])}{link}"
 
 
+def _attachment_variant_key(event: Event) -> str:
+    """Normalize an attachment-added event so PDF/ODT variants share a key."""
+    title = event.summary.partition(":")[2].strip().casefold()
+    for suffix in (".odt", ".pdf"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].rstrip(" ._-–—")
+            break
+    if title:
+        return title
+    return urlparse(event.details.splitlines()[0]).path.rsplit("/", 1)[-1].casefold()
+
+
+def _deduplicate_attachment_additions(events: list[Event]) -> list[Event]:
+    """Keep one user-facing add event per document attachment family.
+
+    Both variants remain persisted and are still audited; the digest prefers
+    ODT because it is the semantic comparison source.
+    """
+    result: list[Event] = []
+    selected: dict[str, Event] = {}
+    for event in events:
+        if event.kind != "attachment_added":
+            result.append(event)
+            continue
+        key = _attachment_variant_key(event)
+        previous = selected.get(key)
+        if previous is None or event.details.lower().endswith(".odt"):
+            selected[key] = event
+    result.extend(selected.values())
+    return result
+
+
 def format_change_digest(events: list[Event], documents: dict[int, Document]) -> str:
     grouped: dict[tuple[str, int | None], list[Event]] = {}
     for event in events:
@@ -36,6 +69,7 @@ def format_change_digest(events: list[Event], documents: dict[int, Document]) ->
         has_document_added = any(event.kind == "document_added" for event in group)
         if has_document_added:
             group = [event for event in group if event.kind != "attachment_added"]
+        group = _deduplicate_attachment_additions(group)
         if group:
             visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
 
@@ -83,6 +117,7 @@ def _format_change_digest_parts(
     for key, group in grouped.items():
         if any(event.kind == "document_added" for event in group):
             group = [event for event in group if event.kind != "attachment_added"]
+        group = _deduplicate_attachment_additions(group)
         if group:
             visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
 
