@@ -1221,6 +1221,52 @@ class TelegramBot:
         if not files:
             await self.send(chat_id, "Старую/новую версию не отправил: файл отсутствует или превышает лимит Telegram. История сохранена на сервере.")
 
+    async def _dispatch_command(self, command: str, parts: list[str], chat_id: int, sender_id: int | None) -> None:
+        """Route an authorized command to its screen or persistent operation."""
+        if not is_admin(sender_id, settings.telegram_admin_id) and not is_user_command_allowed(command):
+            await self.send(chat_id, "Доступно только получение обновлений и настройка личных категорий.")
+            return
+        if command in {"/start", "/help"}:
+            await self._render_screen(chat_id, "main", reset=True)
+        elif command == "/status":
+            message_id = await self._render_screen(chat_id, "status", reset=True)
+            if message_id and is_admin(sender_id, settings.telegram_admin_id) and self.scan_is_running():
+                self.remember_scan_message(chat_id, message_id)
+        elif command in {"/changes", "/events"}:
+            await self._render_screen(chat_id, "changes", reset=True)
+        elif command in {"/report", "/diff"}:
+            event_id = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else await asyncio.to_thread(self.latest_change_id)
+            if event_id is None:
+                await self.send(chat_id, "Изменений для отчёта пока нет.")
+            else:
+                await self.send_report(chat_id, event_id)
+        elif command == "/errors":
+            await self._render_screen(chat_id, "errors", reset=True)
+        elif command == "/clear_errors":
+            text_out, markup = await asyncio.to_thread(self.clear_errors_text)
+            await self._show_screen(chat_id, "errors", text_out, markup, reset=True)
+        elif command == "/users":
+            await self._render_screen(chat_id, "users", reset=True)
+        elif command == "/ignore":
+            await self._render_screen(chat_id, "filters", reset=True)
+        elif command == "/my_ignore":
+            await self._render_screen(chat_id, "my_ignore", reset=True)
+        elif command == "/scan":
+            if self.scan_is_running():
+                message_id = await self._render_screen(chat_id, "scan", reset=True)
+                if message_id and is_admin(sender_id, settings.telegram_admin_id):
+                    self.remember_scan_message(chat_id, message_id)
+            else:
+                await self._show_screen(
+                    chat_id,
+                    "scan",
+                    "🔍 Запустить полную проверку каталога ФСТЭК сейчас?",
+                    telegram_keyboards.scan_confirmation_keyboard(),
+                    reset=True,
+                )
+        elif command == "/settings":
+            await self._render_screen(chat_id, "settings", reset=True)
+
     async def handle(self, update: dict) -> None:
         started_at = time.monotonic()
         if update.get("callback_query"):
@@ -1248,49 +1294,7 @@ class TelegramBot:
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         try:
-            if not is_admin(sender_id, settings.telegram_admin_id) and not is_user_command_allowed(command):
-                await self.send(chat_id, "Доступно только получение обновлений и настройка личных категорий.")
-                return
-            if command in {"/start", "/help"}:
-                await self._render_screen(chat_id, "main", reset=True)
-            elif command == "/status":
-                message_id = await self._render_screen(chat_id, "status", reset=True)
-                if message_id and is_admin(sender_id, settings.telegram_admin_id) and self.scan_is_running():
-                    self.remember_scan_message(chat_id, message_id)
-            elif command in {"/changes", "/events"}:
-                await self._render_screen(chat_id, "changes", reset=True)
-            elif command in {"/report", "/diff"}:
-                event_id = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else await asyncio.to_thread(self.latest_change_id)
-                if event_id is None:
-                    await self.send(chat_id, "Изменений для отчёта пока нет.")
-                else:
-                    await self.send_report(chat_id, event_id)
-            elif command == "/errors":
-                await self._render_screen(chat_id, "errors", reset=True)
-            elif command == "/clear_errors":
-                text_out, markup = await asyncio.to_thread(self.clear_errors_text)
-                await self._show_screen(chat_id, "errors", text_out, markup, reset=True)
-            elif command == "/users":
-                await self._render_screen(chat_id, "users", reset=True)
-            elif command == "/ignore":
-                await self._render_screen(chat_id, "filters", reset=True)
-            elif command == "/my_ignore":
-                await self._render_screen(chat_id, "my_ignore", reset=True)
-            elif command == "/scan":
-                if self.scan_is_running():
-                    message_id = await self._render_screen(chat_id, "scan", reset=True)
-                    if message_id and is_admin(sender_id, settings.telegram_admin_id):
-                        self.remember_scan_message(chat_id, message_id)
-                else:
-                    await self._show_screen(
-                        chat_id,
-                        "scan",
-                        "🔍 Запустить полную проверку каталога ФСТЭК сейчас?",
-                        telegram_keyboards.scan_confirmation_keyboard(),
-                        reset=True,
-                    )
-            elif command == "/settings":
-                await self._render_screen(chat_id, "settings", reset=True)
+            await self._dispatch_command(command, parts, chat_id, sender_id)
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error(f"ошибка команды {command}", exc)
             await self._show_screen(
