@@ -400,6 +400,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
                         s.add(Event(kind="storage_error", severity="critical", summary=f"квота хранилища достигнута при загрузке {url}", details=str(e))); s.commit()
                 except Exception as e:  # noqa: BLE001 — isolate one bad document from the full crawl
                     errors_count += 1
+                    log.warning("scan document failed url=%s error=%r", url, e)
                     with SessionLocal() as s:
                         s.add(Event(kind="fetch_error",severity="warning",summary=f"ошибка загрузки {url}",details=repr(e))); s.commit()
                 finally:
