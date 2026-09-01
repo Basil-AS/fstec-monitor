@@ -312,7 +312,13 @@ class Monitor:
         r.raise_for_status(); data=r.content
         digest,key=self.store.put(data,PathSuffix(att.url,r.headers.get("content-type","")))
         if previous and previous.binary_sha256==digest:return
-        text=semantic_text(data,r.headers.get("content-type",""),att.url); sem=sha(text) if text else ""
+        text = await asyncio.to_thread(
+            semantic_text,
+            data,
+            r.headers.get("content-type", ""),
+            att.url,
+        )
+        sem=sha(text) if text else ""
         _,text_key=self.store.put(text.encode(),".txt") if text else ("","")
         s.add(AttachmentVersion(attachment_id=att.id,status_code=r.status_code,content_type=r.headers.get("content-type",""),content_length=len(data),binary_sha256=digest,semantic_sha256=sem,object_key=key,extracted_text_key=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
         if previous and not baseline:
