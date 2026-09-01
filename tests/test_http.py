@@ -87,3 +87,30 @@ def test_fetcher_timeout_is_an_overall_deadline(monkeypatch):
 
     with pytest.raises(RuntimeError, match="overall timeout"):
         asyncio.run(fetcher.get("https://example.test", timeout=0.01))
+
+
+def test_fetcher_closes_response_after_body_is_loaded(monkeypatch):
+    closed = []
+
+    class Response:
+        status_code = 200
+
+        def close(self):
+            closed.append(True)
+
+    class SuccessfulClient:
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("fstec_monitor.http.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("fstec_monitor.http.settings.request_delay_seconds", 0)
+    monkeypatch.setattr("fstec_monitor.http.settings.max_retries", 1)
+    fetcher = Fetcher.__new__(Fetcher)
+    fetcher.client = SuccessfulClient()
+
+    asyncio.run(fetcher.get("https://example.test"))
+
+    assert closed == [True]

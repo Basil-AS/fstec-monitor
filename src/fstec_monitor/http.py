@@ -34,7 +34,15 @@ class Fetcher:
                         if timeout is not None:
                             request_kwargs["timeout"] = timeout
                         r=await self.client.get(url, **request_kwargs)
-                        if r.status_code in {429,500,502,503,504}: raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+                        if r.status_code in {429,500,502,503,504}:
+                            error = httpx.HTTPStatusError("retryable", request=r.request, response=r)
+                            close = getattr(r, "close", None)
+                            if close:
+                                close()
+                            raise error
+                        close = getattr(r, "close", None)
+                        if close:
+                            close()
                         return r
                     except (httpx.TransportError,httpx.HTTPStatusError) as e:
                         last=e
