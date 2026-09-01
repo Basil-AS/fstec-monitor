@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -13,7 +14,14 @@ from fstec_monitor.crawler import (
     preferred_attachment_urls,
     snapshot_required,
 )
-from fstec_monitor.models import Base, Document, Event, ScanRun, Snapshot
+from fstec_monitor.models import (
+    Attachment,
+    Base,
+    Document,
+    Event,
+    ScanRun,
+    Snapshot,
+)
 
 
 def test_category_key_normalizes_nbsp_and_case():
@@ -67,6 +75,48 @@ def test_preferred_attachment_source_chooses_odt_over_pdf():
 def test_preferred_attachment_source_falls_back_to_pdf():
     link = SimpleNamespace(url="https://example.test/report.pdf", title="Report")
     assert preferred_attachment_urls([link]) == {link.url}
+
+
+def test_attachment_extraction_runs_off_event_loop(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/extract.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    main_thread = threading.current_thread()
+    extraction_threads = []
+
+    def fake_semantic_text(_data, _content_type, _url):
+        extraction_threads.append(threading.current_thread())
+        return "extracted"
+
+    monkeypatch.setattr(crawler, "semantic_text", fake_semantic_text)
+
+    class FakeFetcher:
+        async def get(self, _url, **_kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                content=b"pdf",
+                headers={"content-type": "application/pdf"},
+                raise_for_status=lambda: None,
+            )
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = FakeFetcher()
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/doc", title="Doc")
+            session.add(document)
+            session.flush()
+            attachment = Attachment(document_id=document.id, url="https://example.test/doc.pdf", display_name="doc.pdf")
+            session.add(attachment)
+            session.commit()
+            await monitor.process_attachment(session, document, attachment, baseline=True)
+
+    asyncio.run(run())
+
+    assert extraction_threads
+    assert extraction_threads[0] is not main_thread
 
 
 _HTML = """<html><body><article><h1>Doc</h1><p>Content line</p>
