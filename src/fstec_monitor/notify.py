@@ -41,16 +41,16 @@ def _deduplicate_attachment_additions(events: list[Event]) -> list[Event]:
     ODT because it is the semantic comparison source.
     """
     result: list[Event] = []
-    selected: dict[str, Event] = {}
+    selected: dict[tuple[int | None, str], Event] = {}
     for event in events:
         if event.kind != "attachment_added":
             result.append(event)
             continue
-        key = _attachment_variant_key(event)
+        key = (event.document_id, _attachment_variant_key(event))
         previous = selected.get(key)
         if previous is None or event.details.lower().endswith(".odt"):
             selected[key] = event
-    result.extend(selected.values())
+    result.extend(sorted(selected.values(), key=lambda event: event.id or 0))
     return result
 
 
@@ -72,6 +72,7 @@ def format_change_digest(events: list[Event], documents: dict[int, Document]) ->
         group = _deduplicate_attachment_additions(group)
         if group:
             visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
+    visible_groups.sort(key=lambda item: (item[0][0].casefold(), item[0][1] or 0))
 
     lines = [f"🔔 Изменения ФСТЭК: {sum(len(group) for _, group in visible_groups)} событий"]
     for (category, document_id), group in visible_groups[:20]:
@@ -120,6 +121,7 @@ def _format_change_digest_parts(
         group = _deduplicate_attachment_additions(group)
         if group:
             visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
+    visible_groups.sort(key=lambda item: (item[0][0].casefold(), item[0][1] or 0))
 
     rows: list[tuple[str, Event | None]] = []
     for (category, document_id), group in visible_groups[:20]:
