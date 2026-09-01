@@ -119,6 +119,38 @@ def test_attachment_extraction_runs_off_event_loop(monkeypatch, tmp_path):
     assert extraction_threads[0] is not main_thread
 
 
+def test_attachment_fetch_has_one_overall_timeout(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/attachment-timeout.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    monkeypatch.setattr(crawler.settings, "attachment_timeout_seconds", 0.01)
+
+    class HangingFetcher:
+        async def get(self, _url, **_kwargs):
+            await asyncio.sleep(60)
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = HangingFetcher()
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/doc", title="Doc")
+            session.add(document)
+            session.flush()
+            attachment = Attachment(
+                document_id=document.id,
+                url="https://example.test/doc.odt",
+                display_name="doc.odt",
+            )
+            session.add(attachment)
+            session.commit()
+            with pytest.raises(asyncio.TimeoutError):
+                await monitor.process_attachment(session, document, attachment, baseline=True)
+
+    asyncio.run(run())
+
+
 _HTML = """<html><body><article><h1>Doc</h1><p>Content line</p>
 <a href="/dokumenty/vse-dokumenty/cat/doc/file.pdf">file.pdf</a>
 </article></body></html>"""
