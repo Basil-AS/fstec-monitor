@@ -689,6 +689,7 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     assert "```diff" in md
     assert "-old line" in md and "+new line" in md
     assert "old-Doc.txt" in by_name and "new-Doc.txt" in by_name
+    assert (tmp_path / "objects" / "reports" / f"event-{event_id}.md").read_text() == md
 
 
 def test_report_without_id_uses_latest_meaningful_change(tmp_db):
