@@ -219,7 +219,7 @@ class Monitor:
             # Attachment content is the actual change source. Recheck the
             # preferred ODT/PDF variant on every document fetch; binary hashes
             # make unchanged files cheap while avoiding stale attachment data.
-            audit_attachments = True
+            audit_attachments = previous is None or previous.semantic_sha256 != text_hash or audit_due
             preferred_urls = preferred_attachment_urls(parsed.attachments)
             for link in parsed.attachments:
                 att=s.scalar(select(Attachment).where(Attachment.document_id==doc.id,Attachment.url==link.url))
