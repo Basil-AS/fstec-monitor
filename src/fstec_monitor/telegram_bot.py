@@ -875,6 +875,28 @@ class TelegramBot:
                 errors = session.scalars(select(Event).where(Event.kind.in_(ERROR_KINDS)).order_by(Event.id.desc()).limit(10)).all()
             text = "\\n".join(f"#{event.id} {_dt(event.created_at)} {event.summary}: {event.details[:300]}" for event in errors) or "Ошибок нет."
             view = screen_with_navigation(screen, text, [])
+        elif screen == "help":
+            if is_admin_user:
+                text = (
+                    "ℹ️ <b>Доступные команды</b>\\n\\n"
+                    "/start — главное меню\\n"
+                    "/status — состояние и последний запуск\\n"
+                    "/changes — последние изменения\\n"
+                    "/report — отчёт по последнему событию\\n"
+                    "/scan — запустить проверку\\n"
+                    "/settings — расписание и уведомления\\n"
+                    "/ignore — глобальные категории\\n"
+                    "/users — заявки на доступ\\n"
+                    "/errors — журнал ошибок"
+                )
+            else:
+                text = (
+                    "ℹ️ <b>Доступные действия</b>\\n\\n"
+                    "📰 Последние изменения — новые документы и обновления\\n"
+                    "🚫 Мои категории — персональные фильтры\\n"
+                    "Используйте /start для возврата в меню."
+                )
+            view = screen_with_navigation(screen, text, [])
         else:
             view = screen_with_navigation(screen, "ℹ️ Раздел готов. Используйте кнопки ниже.", [])
         return await self._show_screen(
