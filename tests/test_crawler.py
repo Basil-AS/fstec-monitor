@@ -390,6 +390,30 @@ def test_run_monitor_reports_discovery_and_document_progress(monkeypatch, tmp_pa
         assert session.scalar(select(ScanRun).order_by(ScanRun.id.desc())).finished_at is not None
 
 
+def test_run_monitor_document_timeout_isolated_from_other_documents(monkeypatch, tmp_path):
+    session_factory = _scan_db(monkeypatch, tmp_path, None)
+    processed = []
+
+    class HangingMonitor(_FakeMonitor):
+        def __init__(self):
+            super().__init__(urls={"slow", "fast"})
+
+        async def process_document(self, url, baseline=False):
+            if url == "slow":
+                await asyncio.sleep(60)
+            processed.append(url)
+
+    monkeypatch.setattr(crawler, "Monitor", HangingMonitor)
+    monkeypatch.setattr(crawler.settings, "document_timeout_seconds", 0.01)
+
+    assert asyncio.run(crawler.run_monitor(trigger="test")) == 2
+    assert processed == ["fast"]
+    with session_factory() as session:
+        run = session.scalar(select(ScanRun).order_by(ScanRun.id.desc()))
+        assert run is not None
+        assert run.error == ""
+
+
 def test_run_monitor_honors_cancellation_event(monkeypatch, tmp_path):
     session_factory = _scan_db(monkeypatch, tmp_path, lambda: _FakeMonitor(urls={"a", "b"}))
     cancel_event = asyncio.Event()
