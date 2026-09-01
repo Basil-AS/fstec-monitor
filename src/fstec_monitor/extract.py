@@ -21,7 +21,8 @@ def extract_odt(data: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             xml=zf.read("content.xml")
-        root=etree.fromstring(xml)
+        parser=etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+        root=etree.fromstring(xml, parser=parser)
         texts=[]
         for node in root.xpath("//*[local-name()='p' or local-name()='h' or local-name()='table-row']"):
             text=normalize_space(" ".join(node.itertext()))
