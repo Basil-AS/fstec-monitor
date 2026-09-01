@@ -334,9 +334,13 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
         await gather_workers(process(url) for url in urls)
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError
-        with SessionLocal() as s:
-            reconcile_document_presence(s, set(urls), baseline=baseline)
-            s.commit()
+        # A bounded scan intentionally processes only a sample.  Treating
+        # that sample as a complete catalog would mark every unprocessed
+        # document as missing and emit false removal events.
+        if not limit:
+            with SessionLocal() as s:
+                reconcile_document_presence(s, set(urls), baseline=baseline)
+                s.commit()
         log.info("scan workers completed documents=%d", len(urls))
     except BaseException as e:
         error=repr(e)
