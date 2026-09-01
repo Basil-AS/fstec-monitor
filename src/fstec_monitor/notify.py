@@ -12,6 +12,7 @@ from .models import BotSetting, Document, Event, EventDelivery, UserAccess, User
 from .telegram_bot import api_url
 
 log = logging.getLogger(__name__)
+TELEGRAM_TEXT_LIMIT = 4096
 
 
 def format_event(e: Event, document_url: str = "") -> str:
@@ -52,6 +53,55 @@ def format_change_digest(events: list[Event], documents: dict[int, Document]) ->
     return "\n".join(lines)
 
 
+def _split_digest(header: str, rows: list[tuple[str, Event | None]]) -> list[tuple[str, list[Event]]]:
+    parts: list[tuple[str, list[Event]]] = []
+    lines = [header]
+    events: list[Event] = []
+    for line, event in rows:
+        if len("\n".join(lines + [line])) > TELEGRAM_TEXT_LIMIT and len(lines) > 1:
+            parts.append(("\n".join(lines), events))
+            lines = [header]
+            events = []
+        lines.append(line)
+        if event is not None:
+            events.append(event)
+    if len(lines) > 1:
+        parts.append(("\n".join(lines), events))
+    return parts
+
+
+def _format_change_digest_parts(
+    events: list[Event], documents: dict[int, Document]
+) -> list[tuple[str, list[Event]]]:
+    grouped: dict[tuple[str, int | None], list[Event]] = {}
+    for event in events:
+        document = documents.get(event.document_id) if event.document_id else None
+        category = getattr(document, "category", "") if document else ""
+        grouped.setdefault((category or "Без категории", event.document_id), []).append(event)
+
+    visible_groups: list[tuple[tuple[str, int | None], list[Event]]] = []
+    for key, group in grouped.items():
+        if any(event.kind == "document_added" for event in group):
+            group = [event for event in group if event.kind != "attachment_added"]
+        if group:
+            visible_groups.append((key, sorted(group, key=lambda event: (event.kind != "document_added", event.id))))
+
+    rows: list[tuple[str, Event | None]] = []
+    for (category, document_id), group in visible_groups[:20]:
+        document = documents.get(document_id) if document_id else None
+        title = getattr(document, "title", "") if document else "Общие события"
+        link = f' · <a href="{escape(document.canonical_url, quote=True)}">открыть</a>' if document else ""
+        rows.append((f"\n📁 <b>{escape(category)}</b>\n<b>{escape(title)}</b>", None))
+        for event in group:
+            icon = {"critical": "🔴", "warning": "🟠", "info": "🔵"}.get(event.severity, "⚪")
+            rows.append((f"{icon} {escape(event.summary[:240])} <code>{escape(event.kind)}</code>{link}", event))
+    if len(visible_groups) > 20:
+        rows.append((f"… и ещё {len(visible_groups) - 20} документов. Подробности: /changes", None))
+    return _split_digest(
+        f"🔔 Изменения ФСТЭК: {sum(len(group) for _, group in visible_groups)} событий", rows
+    )
+
+
 MEANINGFUL_KINDS = {
     "document_added",
     "document_removed",
@@ -75,14 +125,18 @@ def should_notify_event(e: Event) -> bool:
 
 
 def format_error_digest(events: list[Event]) -> str:
-    lines = [f"🔴 Ошибки проверки: {len(events)} событий"]
+    return _format_error_digest_parts(events)[0][0] if events else ""
+
+
+def _format_error_digest_parts(events: list[Event]) -> list[tuple[str, list[Event]]]:
+    rows: list[tuple[str, Event | None]] = []
     for event in events[:20]:
         detail = event.details.replace("\n", " ")[:240]
         suffix = f" — {detail}" if detail else ""
-        lines.append(f"• {escape(event.kind)}: {escape(event.summary)}{escape(suffix)}")
+        rows.append((f"• {escape(event.kind)}: {escape(event.summary)}{escape(suffix)}", event))
     if len(events) > 20:
-        lines.append(f"… и ещё {len(events) - 20}")
-    return "\n".join(lines)
+        rows.append((f"… и ещё {len(events) - 20}", None))
+    return _split_digest(f"🔴 Ошибки проверки: {len(events)} событий", rows)
 
 
 def error_key(event: Event) -> tuple[str, int | None, str]:
@@ -185,35 +239,37 @@ async def notify_pending(session) -> int:
             pending_errors = [event for event in error_events if event.id not in delivered and visible(event)]
             pending_changes = [event for event in unique_events if event.id not in delivered and visible(event)]
             messages = (
-                (format_error_digest(pending_errors), pending_errors),
-                (format_change_digest(pending_changes, documents), pending_changes),
+                (_format_error_digest_parts(pending_errors), pending_errors),
+                (_format_change_digest_parts(pending_changes, documents), pending_changes),
             )
-            for message, message_events in messages:
-                if not message_events:
+            for parts, message_events in messages:
+                if not message_events or not parts:
                     continue
-                if not message:
-                    continue
-                try:
-                    r = await client.post(
-                        api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
-                        json={
-                            "chat_id": chat_id,
-                            "text": message,
-                            "parse_mode": "HTML",
-                            "link_preview_options": {"is_disabled": True},
-                        },
-                    )
-                    r.raise_for_status()
-                    body = r.json()
-                    if not body.get("ok"):
-                        raise RuntimeError(body.get("description", "Telegram API rejected notification"))
-                except (httpx.HTTPError, RuntimeError) as exc:
-                    log.warning("notification digest failed chat=%s: %s", chat_id, exc)
-                    continue
-                for event in message_events:
-                    session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
-                session.commit()
-                sent += 1
+                delivered_digest = True
+                for message, _ in parts:
+                    try:
+                        r = await client.post(
+                            api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
+                            json={
+                                "chat_id": chat_id,
+                                "text": message,
+                                "parse_mode": "HTML",
+                                "link_preview_options": {"is_disabled": True},
+                            },
+                        )
+                        r.raise_for_status()
+                        body = r.json()
+                        if not body.get("ok"):
+                            raise RuntimeError(body.get("description", "Telegram API rejected notification"))
+                    except (httpx.HTTPError, RuntimeError) as exc:
+                        log.warning("notification digest failed chat=%s: %s", chat_id, exc)
+                        delivered_digest = False
+                        break
+                    sent += 1
+                if delivered_digest:
+                    for event in message_events:
+                        session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
+                    session.commit()
 
     for event in candidate_events:
         if all(
