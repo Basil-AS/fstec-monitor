@@ -185,6 +185,13 @@ class MessageLifecycleManager:
                         message_id = current_message_id
                     elif is_missing_message(exc):
                         message_id = await self.transport.send(chat_id, text, reply_markup)
+                    elif is_not_editable(exc):
+                        # A message can remain in the chat but lose editability
+                        # (for example after it was converted to a different
+                        # Telegram message type). Close it best-effort before
+                        # placing the replacement at the chat tail.
+                        await self.cleanup_old_menu(chat_id)
+                        message_id = await self.transport.send(chat_id, text, reply_markup)
                     else:
                         raise
             else:
@@ -335,3 +342,8 @@ def is_not_modified(error: BaseException) -> bool:
 def is_missing_message(error: BaseException) -> bool:
     message = str(error).casefold()
     return "message to edit not found" in message or "message not found" in message
+
+
+def is_not_editable(error: BaseException) -> bool:
+    message = str(error).casefold()
+    return "can't be edited" in message or "cannot be edited" in message
