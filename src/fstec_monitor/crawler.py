@@ -150,6 +150,83 @@ class Monitor:
                     queue.append(link.url)
             if len(seen)>10000: raise RuntimeError("crawl safety limit exceeded")
         return docs
+    async def _sync_attachments(self, session, doc, attachments, previous, text_hash, baseline, is_new, audit_due, now):
+        """Synchronize attachment presence and audit the preferred variant."""
+        active_urls = {attachment.url for attachment in attachments}
+        known = session.scalars(select(Attachment).where(Attachment.document_id == doc.id)).all()
+        for attachment in known:
+            if attachment.url not in active_urls and attachment.active:
+                attachment.active = False
+                if not baseline:
+                    self.event(
+                        session,
+                        doc,
+                        "attachment_removed",
+                        "warning",
+                        f"удалено вложение: {attachment.display_name}",
+                        attachment.url,
+                    )
+
+        # Attachment content is the actual change source. Recheck the
+        # preferred ODT/PDF variant on every document fetch; binary hashes
+        # make unchanged files cheap while avoiding stale attachment data.
+        audit_attachments = previous is None or previous.semantic_sha256 != text_hash or audit_due
+        preferred_urls = preferred_attachment_urls(attachments)
+        for link in attachments:
+            attachment = session.scalar(
+                select(Attachment).where(
+                    Attachment.document_id == doc.id,
+                    Attachment.url == link.url,
+                )
+            )
+            if not attachment:
+                attachment = Attachment(document_id=doc.id, url=link.url, display_name=link.title)
+                session.add(attachment)
+                session.flush()
+                # A new document already explains the attachment. Emitting
+                # one more event per format produced misleading floods.
+                if not baseline and not is_new:
+                    self.event(
+                        session,
+                        doc,
+                        "attachment_added",
+                        "warning",
+                        f"добавлено вложение: {link.title}",
+                        link.url,
+                    )
+            attachment.active = True
+            attachment.last_seen_at = datetime.now(UTC)
+            attachment.display_name = link.title
+            if link.url not in preferred_urls:
+                continue
+            if audit_attachments or not session.scalar(
+                select(AttachmentVersion.id)
+                .where(AttachmentVersion.attachment_id == attachment.id)
+                .limit(1)
+            ):
+                try:
+                    await self.process_attachment(session, doc, attachment, baseline)
+                except StorageQuotaExceeded as exc:
+                    self.event(
+                        session,
+                        doc,
+                        "storage_error",
+                        "critical",
+                        f"квота хранилища достигнута: {attachment.display_name}",
+                        str(exc),
+                    )
+                except Exception as exc:  # noqa: BLE001 — isolate one broken attachment
+                    self.event(
+                        session,
+                        doc,
+                        "fetch_error",
+                        "warning",
+                        f"ошибка вложения: {attachment.display_name}",
+                        repr(exc),
+                    )
+        if audit_attachments:
+            doc.last_attachment_audit_at = now
+
     async def process_document(self,url:str,baseline:bool=False):
         with SessionLocal() as cached_session:
             cached_doc=cached_session.scalar(select(Document).where(Document.canonical_url==url))
@@ -210,37 +287,17 @@ class Monitor:
                     self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
             doc.current_html_sha256=html_hash; doc.current_semantic_sha256=text_hash; doc.current_etag=r.headers.get("etag", ""); doc.current_last_modified=r.headers.get("last-modified", "")
             doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
-            active_urls={a.url for a in parsed.attachments}
-            known=s.scalars(select(Attachment).where(Attachment.document_id==doc.id)).all()
-            for a in known:
-                if a.url not in active_urls and a.active:
-                    a.active=False
-                    if not baseline:self.event(s,doc,"attachment_removed","warning",f"удалено вложение: {a.display_name}",a.url)
-            # Attachment content is the actual change source. Recheck the
-            # preferred ODT/PDF variant on every document fetch; binary hashes
-            # make unchanged files cheap while avoiding stale attachment data.
-            audit_attachments = previous is None or previous.semantic_sha256 != text_hash or audit_due
-            preferred_urls = preferred_attachment_urls(parsed.attachments)
-            for link in parsed.attachments:
-                att=s.scalar(select(Attachment).where(Attachment.document_id==doc.id,Attachment.url==link.url))
-                if not att:
-                    att=Attachment(document_id=doc.id,url=link.url,display_name=link.title); s.add(att); s.flush()
-                    # A new document already explains the attachment. Emitting
-                    # one more event per format produced misleading floods.
-                    if not baseline and not is_new:
-                        self.event(s,doc,"attachment_added","warning",f"добавлено вложение: {link.title}",link.url)
-                att.active=True; att.last_seen_at=datetime.now(UTC); att.display_name=link.title
-                if link.url not in preferred_urls:
-                    continue
-                if audit_attachments or not s.scalar(select(AttachmentVersion.id).where(AttachmentVersion.attachment_id==att.id).limit(1)):
-                    try:
-                        await self.process_attachment(s,doc,att,baseline)
-                    except StorageQuotaExceeded as exc:
-                        self.event(s, doc, "storage_error", "critical", f"квота хранилища достигнута: {att.display_name}", str(exc))
-                    except Exception as exc:  # noqa: BLE001 — one broken attachment must not hide the document
-                        self.event(s, doc, "fetch_error", "warning", f"ошибка вложения: {att.display_name}", repr(exc))
-            if audit_attachments:
-                doc.last_attachment_audit_at=now
+            await self._sync_attachments(
+                s,
+                doc,
+                parsed.attachments,
+                previous,
+                text_hash,
+                baseline,
+                is_new,
+                audit_due,
+                now,
+            )
             if is_new and not baseline:self.event(s,doc,"document_added","warning",f"добавлен документ: {doc.title or url}",url)
             s.commit()
     async def process_attachment(self,s,doc,att,baseline):
