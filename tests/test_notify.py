@@ -67,6 +67,36 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
+def test_attachment_variants_are_deduplicated_per_document():
+    events = [
+        Event(document_id=1, kind="attachment_added", summary="добавлено вложение: Report.pdf", details="https://example.test/report.pdf"),
+        Event(document_id=1, kind="attachment_added", summary="добавлено вложение: Report.odt", details="https://example.test/report.odt"),
+        Event(document_id=2, kind="attachment_added", summary="добавлено вложение: Report.pdf", details="https://example.test/other.pdf"),
+    ]
+
+    result = notify_module._deduplicate_attachment_additions(events)
+
+    assert len(result) == 2
+    assert {event.document_id for event in result} == {1, 2}
+
+
+def test_change_digest_orders_categories_before_their_updates():
+    documents = {
+        1: Document(canonical_url="https://example.test/b", title="B doc", category="Бета"),
+        2: Document(canonical_url="https://example.test/a", title="A doc", category="Альфа"),
+    }
+    events = [
+        Event(document_id=1, kind="document_added", severity="info", summary="Документ B"),
+        Event(document_id=1, kind="attachment_content_changed", severity="info", summary="Файл B"),
+        Event(document_id=2, kind="document_added", severity="info", summary="Документ A"),
+    ]
+
+    digest = notify_module.format_change_digest(events, documents)
+
+    assert digest.index("📁 <b>Альфа") < digest.index("📁 <b>Бета")
+    assert digest.index("Документ A") < digest.index("Файл B")
+
+
 def test_notify_pending_splits_oversized_digest(monkeypatch, tmp_path):
     session = _session(tmp_path)
     document = Document(canonical_url="https://example.test/doc", title="Doc")
