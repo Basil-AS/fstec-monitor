@@ -15,6 +15,9 @@ from .notify import notify_pending
 
 app=typer.Typer(no_args_is_help=True); console=Console()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# httpx includes the full request URL in INFO records; the Bot API URL contains
+# the bot token, so keep request logging quiet in CLI scans as well as polling.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 @app.command()
 def init():
