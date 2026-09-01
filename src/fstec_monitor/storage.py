@@ -39,5 +39,24 @@ class ObjectStore:
             tmp.replace(path)
         return digest, str(rel)
 
+    def save_report(self, event_id: int, data: bytes) -> str:
+        """Persist a generated Markdown report without ever deleting report files."""
+        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1:
+            raise ValueError("event_id must be a positive integer")
+
+        rel = Path("reports") / f"event-{event_id}.md"
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous_size = path.stat().st_size if path.exists() else 0
+        current = self.usage_bytes()
+        if current - previous_size + len(data) > self.quota_bytes:
+            raise StorageQuotaExceeded(
+                f"storage quota exceeded: {current - previous_size + len(data)} > {self.quota_bytes} bytes"
+            )
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        return str(rel)
+
     def read(self, key: str) -> bytes:
         return (self.root / key).read_bytes()

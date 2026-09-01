@@ -22,6 +22,15 @@ def test_store_rejects_new_object_over_quota_and_keeps_old_data(tmp_path: Path):
     assert store.usage_bytes() == 3
 
 
+def test_save_report_preserves_markdown_report(tmp_path: Path):
+    store = ObjectStore(tmp_path / "objects", quota_root=tmp_path, quota_bytes=10_000)
+
+    path = store.save_report(42, b"# Change report\n\n- updated\n")
+
+    assert path == "reports/event-42.md"
+    assert (tmp_path / "objects" / path).read_bytes() == b"# Change report\n\n- updated\n"
+
+
 def test_worker_gather_waits_for_slow_workers_after_one_fails():
     finished = []
 

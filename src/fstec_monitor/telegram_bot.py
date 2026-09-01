@@ -35,7 +35,7 @@ from .schedule import (
     next_scheduled_at,
     schedule_label,
 )
-from .storage import ObjectStore
+from .storage import ObjectStore, StorageQuotaExceeded
 from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
@@ -1225,6 +1225,10 @@ class TelegramBot:
                     path = Path(store.root) / snapshot.normalized_text_object
                     if path.exists() and path.stat().st_size <= settings.telegram_max_file_bytes:
                         files.append((f"{prefix}-{safe_filename(doc.title)}", path.read_bytes(), "версия HTML-текста"))
+        try:
+            store.save_report(event_id, report.encode("utf-8"))
+        except (OSError, StorageQuotaExceeded) as exc:
+            log.warning("report persistence failed event_id=%s error=%s", event_id, type(exc).__name__)
         return report, files
 
     async def send_report(self, chat_id: int, event_id: int) -> None:
