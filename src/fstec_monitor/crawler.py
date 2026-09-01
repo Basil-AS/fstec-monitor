@@ -46,6 +46,11 @@ def release_scan_lock(handle) -> None:
     handle.close()
 
 
+def scan_concurrency() -> int:
+    """Avoid concurrent write transactions when the store is SQLite."""
+    return 1 if settings.database_url.startswith("sqlite") else settings.max_concurrency
+
+
 def category_key(value: str) -> str:
     return " ".join(value.replace("\xa0", " ").split()).casefold()
 
@@ -406,7 +411,7 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
         if limit: urls=urls[:limit]
         log.info("catalog discovery completed documents=%d", len(urls))
         report("Проверка документов", 0, len(urls), 0)
-        semaphore=asyncio.Semaphore(settings.max_concurrency)
+        semaphore=asyncio.Semaphore(scan_concurrency())
         async def process(url):
             nonlocal completed, errors_count
             if cancel_event and cancel_event.is_set():
