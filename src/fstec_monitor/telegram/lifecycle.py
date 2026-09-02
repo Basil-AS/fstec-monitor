@@ -10,7 +10,15 @@ log = logging.getLogger(__name__)
 
 
 class MessageTransport(Protocol):
-    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int:
+    async def send(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
+    ) -> int:
         ...
 
     async def edit_message(
@@ -19,6 +27,9 @@ class MessageTransport(Protocol):
         message_id: int,
         text: str,
         reply_markup: dict | None = None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
     ) -> None:
         ...
 
@@ -188,26 +199,39 @@ class MessageLifecycleManager:
             if can_edit:
                 current_message_id = session.message_id
                 try:
-                    await self.transport.edit_message(chat_id, current_message_id, text, reply_markup)
+                    await self.transport.edit_message(
+                        chat_id,
+                        current_message_id,
+                        text,
+                        reply_markup,
+                        screen=screen,
+                        reason=reason,
+                    )
                     message_id = current_message_id
                 except Exception as exc:
                     if is_not_modified(exc):
                         message_id = current_message_id
                     elif is_missing_message(exc):
-                        message_id = await self.transport.send(chat_id, text, reply_markup)
+                        message_id = await self.transport.send(
+                            chat_id, text, reply_markup, screen=screen, reason=reason
+                        )
                     elif is_not_editable(exc):
                         # A message can remain in the chat but lose editability
                         # (for example after it was converted to a different
                         # Telegram message type). Close it best-effort before
                         # placing the replacement at the chat tail.
                         await self.cleanup_old_menu(chat_id)
-                        message_id = await self.transport.send(chat_id, text, reply_markup)
+                        message_id = await self.transport.send(
+                            chat_id, text, reply_markup, screen=screen, reason=reason
+                        )
                     else:
                         raise
             else:
                 if session.message_id is not None and session.message_id not in session.persistent_message_ids:
                     await self.cleanup_old_menu(chat_id)
-                message_id = await self.transport.send(chat_id, text, reply_markup)
+                message_id = await self.transport.send(
+                    chat_id, text, reply_markup, screen=screen, reason=reason
+                )
             if message_id is None:
                 return None
             session.message_id = message_id
@@ -224,7 +248,7 @@ class MessageLifecycleManager:
         text: str,
         reply_markup: dict | None = None,
     ) -> int | None:
-        return await self.show_screen(chat_id, "scan", text, reply_markup)
+        return await self.show_screen(chat_id, "scan", text, reply_markup, reason="progress")
 
     async def publish_persistent(
         self,
@@ -233,7 +257,9 @@ class MessageLifecycleManager:
         reply_markup: dict | None = None,
     ) -> int | None:
         async with self._lock(chat_id):
-            message_id = await self.transport.send(chat_id, text, reply_markup)
+            message_id = await self.transport.send(
+                chat_id, text, reply_markup, screen="persistent", reason="persistent"
+            )
             if message_id is not None:
                 self.remember_message(chat_id, message_id, persistent=True)
             return message_id
@@ -245,7 +271,9 @@ class MessageLifecycleManager:
         ttl: float = 8.0,
     ) -> int | None:
         async with self._lock(chat_id):
-            message_id = await self.transport.send(chat_id, text)
+            message_id = await self.transport.send(
+                chat_id, text, screen="temporary", reason="temporary"
+            )
         if message_id is None:
             return None
         self.session(chat_id).temporary_message_ids.add(message_id)
