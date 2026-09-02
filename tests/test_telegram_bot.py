@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from typing import ClassVar
 
+import httpx
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -152,6 +153,22 @@ def test_scan_progress_refresh_edits_one_saved_message():
     assert len(edited) == 1
     assert edited[0][:2] == (123, 77)
     assert "3/10" in edited[0][2]
+
+
+def test_scan_progress_refresh_swallows_transport_failure_without_losing_state():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_status_message = (123, 77)
+    bot.scan_progress = ScanProgress(state="running", stage="Документы")
+
+    async def edit_message(*_args):
+        raise httpx.ReadTimeout("telegram unavailable")
+
+    bot.edit_message = edit_message
+    asyncio.run(bot.refresh_scan_status())
+
+    assert bot.scan_status_message == (123, 77)
 
 
 def test_temporary_message_is_deleted_after_ttl():

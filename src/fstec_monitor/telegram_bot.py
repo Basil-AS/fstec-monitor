@@ -472,10 +472,15 @@ class TelegramBot:
             return
         try:
             await self.edit_message(chat_id, message_id, text, markup)
-        except RuntimeError as exc:
-            if "message is not modified" not in str(exc).lower():
+        except (OSError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+            error_text = str(exc).lower()
+            if any(marker in error_text for marker in ("message to edit not found", "message not found", "can't be edited", "cannot be edited")):
                 log.debug("scan status message cannot be updated: %s", exc)
                 self.scan_status_message = None
+            else:
+                # A transient transport failure must not discard the pointer:
+                # the next coalesced update can recover the same screen.
+                log.debug("scan status update deferred: %s", exc)
 
     def scan_progress_card(self) -> tuple[str, dict]:
         progress = getattr(self, "scan_progress", ScanProgress())
