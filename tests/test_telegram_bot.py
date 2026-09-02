@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import fstec_monitor.telegram_bot as telegram_bot_module
-from fstec_monitor.models import Base, Document, Event, Snapshot
+from fstec_monitor.models import Base, Document, Event, Snapshot, UserAccess
 from fstec_monitor.notify import (
     format_change_digest,
     format_event,
@@ -805,6 +805,18 @@ def test_user_ignore_toggle_is_private_to_that_user(tmp_db):
     text, markup = bot.user_ignore_text(42)
     assert "Приказы" in text
     assert any(f"v1:userignore:{token}" == button["callback_data"] for row in markup["inline_keyboard"] for button in row)
+
+
+def test_admin_user_actions_use_versioned_callback_protocol(tmp_db):
+    with tmp_db() as session:
+        session.add(UserAccess(user_id=42, chat_id=42, status="pending"))
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    _, markup = bot.users_text()
+
+    callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
+    assert callbacks == ["v1:access:approve-42", "v1:access:deny-42"]
 
 
 def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):
