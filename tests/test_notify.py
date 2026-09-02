@@ -59,6 +59,7 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
 
     sent = asyncio.run(notify_module.notify_pending(session))
 
@@ -167,6 +168,36 @@ def test_notify_pending_delivers_event_to_each_approved_chat(monkeypatch, tmp_pa
     assert session.scalar(select(Event).where(Event.notified.is_(False))) is None
     assert session.scalar(select(EventDelivery.event_id)) is not None
     assert len(session.scalars(select(EventDelivery)).all()) == 3
+
+
+def test_notify_pending_serializes_concurrent_delivery_passes(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    session.add(Event(kind="document_added", severity="info", summary="Новый документ"))
+    session.commit()
+    second = _session(tmp_path)
+    _TelegramClient.calls = []
+
+    class SlowTelegramClient(_TelegramClient):
+        async def post(self, url, **kwargs):
+            await asyncio.sleep(0.05)
+            return await super().post(url, **kwargs)
+
+    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: SlowTelegramClient())
+    monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+    monkeypatch.setattr(notify_module.settings, "storage_dir", str(tmp_path / "objects"))
+
+    async def run_both():
+        return await asyncio.gather(
+            notify_module.notify_pending(session),
+            notify_module.notify_pending(second),
+        )
+
+    sent = asyncio.run(run_both())
+
+    assert sorted(sent) == [0, 1]
+    assert len(_TelegramClient.calls) == 1
 
 
 def test_notify_pending_applies_personal_category_ignore(monkeypatch, tmp_path):

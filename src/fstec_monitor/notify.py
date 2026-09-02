@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import logging
 from html import escape
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -14,6 +17,41 @@ from .telegram_bot import api_url
 
 log = logging.getLogger(__name__)
 TELEGRAM_TEXT_LIMIT = 4096
+
+
+def _notification_lock_path() -> Path:
+    return Path(settings.storage_dir).resolve().parent / ".notify.lock"
+
+
+def _acquire_notification_lock():
+    path = _notification_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_notification_lock(handle) -> None:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def _single_flight(coro):
+    async def wrapped(*args, **kwargs):
+        handle = await asyncio.to_thread(_acquire_notification_lock)
+        if handle is None:
+            log.info("notification delivery already running; deferring this pass")
+            return 0
+        try:
+            return await coro(*args, **kwargs)
+        finally:
+            await asyncio.to_thread(_release_notification_lock, handle)
+
+    return wrapped
 
 
 def format_event(e: Event, document_url: str = "") -> str:
@@ -194,6 +232,7 @@ def split_new_errors(events: list[Event], previously_notified: list[Event]) -> t
             unique.append(event)
     return unique, duplicates
 
+@_single_flight
 async def notify_pending(session) -> int:
     if not settings.telegram_bot_token:
         return 0
