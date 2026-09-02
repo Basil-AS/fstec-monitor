@@ -1260,6 +1260,9 @@ class TelegramBot:
         return report, files
 
     async def send_report(self, chat_id: int, event_id: int) -> None:
+        send_chat_action = getattr(self, "send_chat_action", None)
+        if send_chat_action is not None:
+            await send_chat_action(chat_id, "upload_document")
         result = await asyncio.to_thread(self._build_report, event_id)
         if result is None:
             await self.send(chat_id, f"Событие #{event_id} не найдено.")
