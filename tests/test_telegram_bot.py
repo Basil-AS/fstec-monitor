@@ -272,6 +272,29 @@ def test_non_admin_command_whitelist_excludes_operations():
     assert not is_user_command_allowed("/settings")
 
 
+def test_non_admin_restricted_command_uses_temporary_feedback(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    temporary = []
+    regular = []
+
+    async def send_temporary(*args, **kwargs):
+        temporary.append((args, kwargs))
+
+    async def send(*args, **kwargs):
+        regular.append((args, kwargs))
+
+    bot.send_temporary = send_temporary
+    bot.send = send
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 1)
+
+    asyncio.run(bot._dispatch_command("/scan", ["/scan"], 42, 42))
+
+    assert regular == []
+    assert temporary and temporary[0][0][1].startswith("Доступно только")
+
+
 def test_admin_reply_keyboard_uses_the_same_command_labels_as_command_menu():
     labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
 

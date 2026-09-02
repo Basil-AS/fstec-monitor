@@ -1388,7 +1388,11 @@ class TelegramBot:
     async def _dispatch_command(self, command: str, parts: list[str], chat_id: int, sender_id: int | None) -> None:
         """Route an authorized command to its screen or persistent operation."""
         if not is_admin(sender_id, settings.telegram_admin_id) and not is_user_command_allowed(command):
-            await self.send(chat_id, "Доступно только получение обновлений и настройка личных категорий.")
+            await self.send_temporary(
+                chat_id,
+                "Доступно только получение обновлений и настройка личных категорий.",
+                ttl=8,
+            )
             return
         if command == "/start":
             await self._render_screen(chat_id, "main", reset=True)
