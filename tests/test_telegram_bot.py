@@ -573,6 +573,30 @@ def test_document_lifecycle_events_are_included_in_bot_status_and_changes():
     assert telegram_bot_module.MEANINGFUL_KINDS >= {"document_removed", "document_restored"}
 
 
+def test_changes_text_groups_by_category_and_hides_initial_attachment_noise(tmp_db):
+    with tmp_db() as session:
+        first = Document(canonical_url="https://example.test/1", title="Первый", category="Доклады")
+        second = Document(canonical_url="https://example.test/2", title="Второй", category="Доклады")
+        session.add_all([first, second])
+        session.flush()
+        session.add_all([
+            Event(document_id=first.id, kind="attachment_added", severity="warning", summary="добавлено вложение: Первый.pdf", details="https://example.test/1.pdf"),
+            Event(document_id=first.id, kind="document_added", severity="warning", summary="добавлен документ: Первый"),
+            Event(document_id=first.id, kind="attachment_content_changed", severity="critical", summary="обновлено вложение: Первый.odt"),
+            Event(document_id=second.id, kind="document_added", severity="warning", summary="добавлен документ: Второй"),
+        ])
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    text = bot.changes_text(limit=10)
+
+    assert text.count("📁 Доклады") == 1
+    assert "добавлено вложение: Первый.pdf" not in text
+    assert "добавлен документ: Первый" in text
+    assert "обновлено вложение: Первый.odt" in text
+    assert "добавлен документ: Второй" in text
+
+
 def test_event_report_contains_old_new_and_diff():
     event = Event(
         id=42,
