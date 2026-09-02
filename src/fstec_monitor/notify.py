@@ -232,6 +232,26 @@ def split_new_errors(events: list[Event], previously_notified: list[Event]) -> t
             unique.append(event)
     return unique, duplicates
 
+
+async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict) -> None:
+    """Deliver one notification with the same bounded retry policy as fetches."""
+    attempts = max(1, settings.max_retries)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("ok"):
+                raise RuntimeError(body.get("description", "Telegram API rejected notification"))
+            return
+        except (httpx.HTTPError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(60, 2**attempt))
+    assert last_error is not None
+    raise last_error
+
 @_single_flight
 async def notify_pending(session) -> int:
     if not settings.telegram_bot_token:
@@ -324,19 +344,16 @@ async def notify_pending(session) -> int:
                 delivered_digest = True
                 for message, _ in parts:
                     try:
-                        r = await client.post(
+                        await _post_notification(
+                            client,
                             api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
-                            json={
+                            {
                                 "chat_id": chat_id,
                                 "text": message,
                                 "parse_mode": "HTML",
                                 "link_preview_options": {"is_disabled": True},
                             },
                         )
-                        r.raise_for_status()
-                        body = r.json()
-                        if not body.get("ok"):
-                            raise RuntimeError(body.get("description", "Telegram API rejected notification"))
                     except (httpx.HTTPError, RuntimeError) as exc:
                         log.warning("notification digest failed chat=%s: %s", chat_id, exc)
                         delivered_digest = False

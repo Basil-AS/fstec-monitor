@@ -1,6 +1,7 @@
 import asyncio
 from typing import ClassVar
 
+import httpx
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -66,6 +67,32 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     assert sent == 2
     assert len(_TelegramClient.calls) == 2
     assert all(event.notified for event in session.scalars(select(Event)).all())
+
+
+def test_notify_pending_retries_transient_telegram_transport_failure(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    session.add(Event(kind="document_added", severity="info", summary="Новый документ"))
+    session.commit()
+
+    class RetryingClient(_TelegramClient):
+        attempts = 0
+
+        async def post(self, url, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise httpx.ReadTimeout("temporary Telegram timeout")
+            return await super().post(url, **kwargs)
+
+    client = RetryingClient()
+    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+    monkeypatch.setattr(notify_module.settings, "max_retries", 2)
+    monkeypatch.setattr(notify_module.settings, "request_delay_seconds", 0)
+
+    assert asyncio.run(notify_module.notify_pending(session)) == 1
+    assert client.attempts == 2
 
 
 def test_attachment_variants_are_deduplicated_per_document():
