@@ -1219,6 +1219,44 @@ class TelegramBot:
         await reply(result or "Категория не найдена — откройте раздел заново.", fallback_chat_id=sender_id)
         return True
 
+    async def _reply_to_callback(
+        self,
+        callback: dict,
+        text: str,
+        markup: dict | None = None,
+        fallback_chat_id: int | None = None,
+    ) -> None:
+        """Render callback feedback through the current lifecycle screen."""
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        message_id = message.get("message_id")
+        chat_id = chat.get("id")
+        lifecycle = getattr(self, "lifecycle", None)
+        if lifecycle is not None and chat_id:
+            if (callback.get("data") or "").startswith("scan:"):
+                self.remember_scan_message(chat_id, message_id or lifecycle.session(chat_id).message_id)
+            screen = self._navigation_stack(chat_id).current
+            await lifecycle.show_screen(
+                chat_id,
+                screen,
+                text,
+                markup,
+                source_message=message,
+                reason="callback",
+            )
+            return
+        if chat_id and message_id:
+            if (callback.get("data") or "").startswith("scan:"):
+                self.remember_scan_message(chat_id, message_id)
+            try:
+                await self.edit_message(chat_id, message_id, text, markup)
+                return
+            except RuntimeError as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                log.debug("callback message cannot be edited: %s", exc)
+        await self.send(fallback_chat_id or chat_id or settings.telegram_admin_id, text, markup)
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1251,35 +1289,7 @@ class TelegramBot:
                 log.warning("answerCallbackQuery failed (expired query?): %s", exc)
 
         async def reply(text: str, markup: dict | None = None, fallback_chat_id: int | None = None) -> None:
-            message = callback.get("message") or {}
-            chat = message.get("chat") or {}
-            message_id = message.get("message_id")
-            chat_id = chat.get("id")
-            lifecycle = getattr(self, "lifecycle", None)
-            if lifecycle is not None and chat_id:
-                if (callback.get("data") or "").startswith("scan:"):
-                    self.remember_scan_message(chat_id, message_id or lifecycle.session(chat_id).message_id)
-                screen = self._navigation_stack(chat_id).current
-                await lifecycle.show_screen(
-                    chat_id,
-                    screen,
-                    text,
-                    markup,
-                    source_message=message,
-                    reason="callback",
-                )
-                return
-            if chat_id and message_id:
-                if (callback.get("data") or "").startswith("scan:"):
-                    self.remember_scan_message(chat_id, message_id)
-                try:
-                    await self.edit_message(chat_id, message_id, text, markup)
-                    return
-                except RuntimeError as exc:
-                    if "message is not modified" in str(exc).lower():
-                        return
-                    log.debug("callback message cannot be edited: %s", exc)
-            await self.send(fallback_chat_id or chat_id or settings.telegram_admin_id, text, markup)
+            await self._reply_to_callback(callback, text, markup, fallback_chat_id)
 
         sender_id = sender.get("id")
         data = raw_data.split(":")
