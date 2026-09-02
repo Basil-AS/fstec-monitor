@@ -247,11 +247,24 @@ class MessageLifecycleManager:
 
     async def _delete_temporary(self, chat_id: int, message_id: int, ttl: float) -> None:
         await asyncio.sleep(ttl)
+        session = self.session(chat_id)
         try:
             await self.transport.delete_message(chat_id, message_id)
         except (OSError, RuntimeError, TimeoutError):
-            return
-        self.session(chat_id).temporary_message_ids.discard(message_id)
+            log.debug("temporary message cleanup skipped chat=%s message=%s", chat_id, message_id)
+        session.temporary_message_ids.discard(message_id)
+        if session.last_message_id == message_id:
+            known_ids = {
+                current_id
+                for current_id in (
+                    session.message_id,
+                    *session.persistent_message_ids,
+                    *session.temporary_message_ids,
+                    *session.context_message_ids,
+                )
+                if current_id is not None
+            }
+            session.last_message_id = max(known_ids, default=None)
 
     async def close_screen(self, chat_id: int) -> None:
         async with self._lock(chat_id):

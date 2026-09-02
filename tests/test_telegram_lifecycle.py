@@ -208,3 +208,22 @@ def test_temporary_message_is_tracked_separately_from_screen() -> None:
         assert (7, temporary) in transport.deleted
 
     asyncio.run(scenario())
+
+
+def test_temporary_message_cleanup_restores_reusable_menu_tail() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+
+        menu = await lifecycle.show_screen(7, "main", "Главное меню", None)
+        temporary = await lifecycle.show_temporary(7, "Обновлено", ttl=0.01)
+        await asyncio.sleep(0.02)
+        await lifecycle.show_screen(7, "settings", "Настройки", None)
+
+        assert temporary is not None
+        assert menu == lifecycle.session(7).message_id
+        assert len(transport.sent) == 2
+        assert len(transport.edited) == 1
+        assert transport.edited[0][1] == menu
+
+    asyncio.run(scenario())
