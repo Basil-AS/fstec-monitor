@@ -383,6 +383,38 @@ def test_duplicate_scan_callback_uses_already_running_toast():
     })
 
 
+def test_unexpected_scan_error_marks_progress_failed_and_reports_it():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_progress = ScanProgress(state="running", stage="Проверка документов")
+    bot.scan_cancel_event = asyncio.Event()
+    refreshed = []
+    reported = []
+
+    async def scan(**_kwargs):
+        raise KeyError("broken state")
+
+    async def refresh():
+        refreshed.append(True)
+
+    async def report(context, exc):
+        reported.append((context, exc))
+
+    bot.scan = scan
+    bot.refresh_scan_status = refresh
+    bot.report_error = report
+
+    with pytest.raises(KeyError):
+        asyncio.run(bot._scan_task())
+
+    assert bot.scan_progress.state == "failed"
+    assert "Проверка завершилась с ошибкой" == bot.scan_progress.stage
+    assert bot.scan_progress.last_error == "'broken state'"
+    assert refreshed == [True]
+    assert reported and reported[0][0] == "ошибка фоновой проверки"
+
+
 def test_stale_callback_is_acknowledged_but_does_not_dispatch():
     import asyncio
 
