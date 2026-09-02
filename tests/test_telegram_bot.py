@@ -544,6 +544,22 @@ def test_scan_progress_text_shows_stage_progress_and_controls():
     assert "v1:scan:stop" in callbacks
 
 
+def test_legacy_scan_callback_adapter_handles_cancel_without_new_message():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_progress = ScanProgress(state="running", stage="Проверка документов")
+    replies = []
+
+    async def reply(text, markup=None, fallback_chat_id=None):
+        replies.append((text, markup, fallback_chat_id))
+
+    handled = asyncio.run(bot._dispatch_legacy_scan_callback(["scan", "stop", "cancel"], reply))
+
+    assert handled is True
+    assert replies and "Остановка отменена" in replies[0][0]
+
+
 def test_active_scan_cannot_be_started_twice_and_can_be_stopped():
     import asyncio
 
@@ -997,7 +1013,7 @@ def test_scan_control_callbacks_show_progress_and_confirm_stop():
 
     asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:stop"}))
     assert "Остановить" in sent[-1][0]
-    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "scan:stop:confirm"
+    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:stop-confirm"
 
     asyncio.run(bot.handle_callback({"id": "c3", "from": {"id": 151599744}, "data": "scan:stop:confirm"}))
     assert "остановка" in sent[-1][0].lower()

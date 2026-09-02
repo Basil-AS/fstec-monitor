@@ -1113,6 +1113,57 @@ class TelegramBot:
             {"inline_keyboard": []},
         )
 
+    async def _dispatch_legacy_scan_callback(self, data: list[str], reply) -> bool:
+        """Keep compatibility with scan buttons from pre-v1 bot messages."""
+        if data == ["scan", "status"]:
+            text, markup = self.scan_progress_card()
+            await reply(text, markup)
+            return True
+        if data == ["scan", "stop"]:
+            if not self.scan_is_running():
+                text, markup = self.scan_progress_card()
+                await reply(text, markup)
+                return True
+            await reply("Остановить текущую проверку? Уже обработанные документы сохранятся.", {
+                "inline_keyboard": [[
+                    {"text": "⏹ Да, остановить", "callback_data": telegram_keyboards.encode_callback("scan", "stop-confirm")},
+                    {"text": "Отмена", "callback_data": telegram_keyboards.encode_callback("scan", "stop-cancel")},
+                ]]
+            })
+            return True
+        if data == ["scan", "stop", "cancel"]:
+            text, markup = self.scan_progress_card()
+            await reply("Остановка отменена.\n\n" + text, markup)
+            return True
+        if data == ["scan", "stop", "confirm"]:
+            if self.stop_scan():
+                text, markup = self.scan_progress_card()
+                await reply("⏹ Остановка проверки запрошена.\n\n" + text, markup)
+            else:
+                text, markup = self.scan_progress_card()
+                await reply("Проверка уже завершена.\n\n" + text, markup)
+            return True
+        if data == ["scan", "retry"]:
+            if self.start_scan("retry"):
+                text, markup = self.scan_progress_card()
+                await reply(text, markup)
+            else:
+                text, markup = self.scan_progress_card()
+                await reply("Повторный запуск не выполнен: проверка уже идёт.\n\n" + text, markup)
+            return True
+        if data == ["scan", "run", "cancel"]:
+            await reply("Запуск проверки отменён.")
+            return True
+        if data == ["scan", "run", "confirm"]:
+            if self.start_scan():
+                text, markup = self.scan_progress_card()
+                await reply("Проверка запущена в фоне.\n\n" + text, markup)
+            else:
+                text, markup = self.scan_progress_card()
+                await reply("Проверка уже выполняется.\n\n" + text, markup)
+            return True
+        return False
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1230,6 +1281,8 @@ class TelegramBot:
             return
         if not is_admin(sender_id, settings.telegram_admin_id):
             return
+        if await self._dispatch_legacy_scan_callback(data, reply):
+            return
         if len(data) == 3 and data[0] == "v1" and data[1] == "access":
             await self._handle_access_decision(data[2], reply)
             return
@@ -1258,53 +1311,6 @@ class TelegramBot:
         if data == ["errors", "clear", "confirm"]:
             deleted = await asyncio.to_thread(self.clear_errors)
             await reply(f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
-            return
-        if data == ["scan", "status"]:
-            text, markup = self.scan_progress_card()
-            await reply(text, markup)
-            return
-        if data == ["scan", "stop"]:
-            if not self.scan_is_running():
-                text, markup = self.scan_progress_card()
-                await reply(text, markup)
-                return
-            await reply("Остановить текущую проверку? Уже обработанные документы сохранятся.", {
-                "inline_keyboard": [[
-                    {"text": "⏹ Да, остановить", "callback_data": "scan:stop:confirm"},
-                    {"text": "Отмена", "callback_data": "scan:stop:cancel"},
-                ]]
-            })
-            return
-        if data == ["scan", "stop", "cancel"]:
-            text, markup = self.scan_progress_card()
-            await reply("Остановка отменена.\n\n" + text, markup)
-            return
-        if data == ["scan", "stop", "confirm"]:
-            if self.stop_scan():
-                text, markup = self.scan_progress_card()
-                await reply("⏹ Остановка проверки запрошена.\n\n" + text, markup)
-            else:
-                text, markup = self.scan_progress_card()
-                await reply("Проверка уже завершена.\n\n" + text, markup)
-            return
-        if data == ["scan", "retry"]:
-            if self.start_scan("retry"):
-                text, markup = self.scan_progress_card()
-                await reply(text, markup)
-            else:
-                text, markup = self.scan_progress_card()
-                await reply("Повторный запуск не выполнен: проверка уже идёт.\n\n" + text, markup)
-            return
-        if data == ["scan", "run", "cancel"]:
-            await reply("Запуск проверки отменён.")
-            return
-        if data == ["scan", "run", "confirm"]:
-            if self.start_scan():
-                text, markup = self.scan_progress_card()
-                await reply("Проверка запущена в фоне.\n\n" + text, markup)
-            else:
-                text, markup = self.scan_progress_card()
-                await reply("Проверка уже выполняется.\n\n" + text, markup)
             return
         if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
             result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
