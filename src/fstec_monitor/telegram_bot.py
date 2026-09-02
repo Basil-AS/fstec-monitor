@@ -88,6 +88,17 @@ USER_LABEL_COMMANDS = {
     "ℹ️ Помощь": "/help",
 }
 USER_ALLOWED_COMMANDS = {"/start", "/help", "/changes", "/my_ignore"}
+_IDEMPOTENT_TELEGRAM_METHODS = frozenset({
+    "answerCallbackQuery",
+    "deleteMessage",
+    "editMessageReplyMarkup",
+    "editMessageText",
+    "getUpdates",
+    "sendChatAction",
+    "setChatMenuButton",
+    "setMyCommands",
+})
+_TELEGRAM_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 @dataclass
@@ -196,12 +207,29 @@ class TelegramBot:
         await self.client.aclose()
 
     async def call(self, method: str, payload: dict) -> dict:
-        response = await self.client.post(api_url(settings.telegram_api_root, self.token, method), json=payload)
-        response.raise_for_status()
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
-        return body.get("result", {})
+        url = api_url(settings.telegram_api_root, self.token, method)
+        attempts = max(1, min(settings.max_retries, 3)) if method in _IDEMPOTENT_TELEGRAM_METHODS else 1
+        for attempt in range(attempts):
+            try:
+                response = await self.client.post(url, json=payload)
+                if response.status_code in _TELEGRAM_RETRYABLE_STATUS_CODES and attempt + 1 < attempts:
+                    retry_after = response.headers.get("retry-after")
+                    try:
+                        delay = min(30.0, max(0.0, float(retry_after))) if retry_after else 2.0 ** attempt
+                    except ValueError:
+                        delay = 2.0 ** attempt
+                    await asyncio.sleep(delay)
+                    continue
+                response.raise_for_status()
+                body = response.json()
+                if not body.get("ok"):
+                    raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
+                return body.get("result", {})
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(min(30.0, 2.0 ** attempt))
+        raise RuntimeError(f"Telegram API call exhausted retries: {method}")
 
     def _log_tgux(self, method: str, payload: dict, *, screen: str | None = None, reason: str = "api") -> None:
         if os.getenv("FSTEC_TGUX_LOGGING", "0").casefold() not in {"1", "true", "yes", "on"}:

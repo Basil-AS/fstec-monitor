@@ -36,6 +36,61 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_idempotent_telegram_api_call_retries_transient_timeout(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.token = "token"
+    calls = []
+
+    class Client:
+        async def post(self, url, json):
+            calls.append((url, json))
+            if len(calls) == 1:
+                raise httpx.ReadTimeout("temporary Telegram timeout")
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": True},
+                request=httpx.Request("POST", url),
+            )
+
+    bot.client = Client()
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(telegram_bot_module.asyncio, "sleep", no_sleep)
+
+    assert asyncio.run(bot.call("editMessageText", {"chat_id": 1, "message_id": 2})) is True
+    assert len(calls) == 2
+
+
+def test_send_message_is_not_retried_after_transport_timeout(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.token = "token"
+    calls = []
+
+    class Client:
+        async def post(self, url, json):
+            calls.append((url, json))
+            raise httpx.ReadTimeout("unknown Telegram outcome")
+
+    bot.client = Client()
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(telegram_bot_module.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(bot.call("sendMessage", {"chat_id": 1, "text": "hello"}))
+    assert len(calls) == 1
+
+
 def test_report_command_description_allows_latest_event_default():
     commands = {item["command"]: item["description"] for item in telegram_commands()}
 
