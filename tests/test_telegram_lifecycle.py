@@ -12,20 +12,41 @@ class FakeTransport:
         self.next_message_id = 100
         self.sent: list[tuple[int, str, dict | None]] = []
         self.edited: list[tuple[int, int, str, dict | None]] = []
+        self.send_metadata: list[tuple[str | None, str]] = []
+        self.edit_metadata: list[tuple[str | None, str]] = []
         self.deleted: list[tuple[int, int]] = []
         self.fail_next_edit: Exception | None = None
         self.markup_edits: list[tuple[int, int, dict | None]] = []
 
-    async def send(self, chat_id: int, text: str, reply_markup: dict | None = None) -> int:
+    async def send(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
+    ) -> int:
         self.next_message_id += 1
         self.sent.append((chat_id, text, reply_markup))
+        self.send_metadata.append((screen, reason))
         return self.next_message_id
 
-    async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: dict | None = None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
+    ) -> None:
         if self.fail_next_edit:
             error, self.fail_next_edit = self.fail_next_edit, None
             raise error
         self.edited.append((chat_id, message_id, text, reply_markup))
+        self.edit_metadata.append((screen, reason))
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -238,6 +259,26 @@ def test_temporary_message_is_tracked_separately_from_screen() -> None:
         assert temporary in lifecycle.session(7).temporary_message_ids
         await asyncio.sleep(0.02)
         assert (7, temporary) in transport.deleted
+
+    asyncio.run(scenario())
+
+
+def test_lifecycle_labels_api_calls_for_tgux_journal() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+
+        await lifecycle.show_screen(7, "main", "Главное меню")
+        await lifecycle.show_progress(7, "Проверка 10%")
+        await lifecycle.show_temporary(7, "Сохранено", ttl=60)
+        await lifecycle.publish_persistent(7, "report.md")
+
+        assert transport.send_metadata == [
+            ("main", "navigation"),
+            ("temporary", "temporary"),
+            ("persistent", "persistent"),
+        ]
+        assert transport.edit_metadata == [("scan", "progress")]
 
     asyncio.run(scenario())
 

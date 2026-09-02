@@ -22,17 +22,38 @@ class Transport:
         self.markup: list[tuple[int, int, dict | None]] = []
         self.deleted: list[tuple[int, int]] = []
         self.fail_edit: Exception | None = None
+        self.send_metadata: list[tuple[str | None, str]] = []
+        self.edit_metadata: list[tuple[str | None, str]] = []
 
-    async def send(self, chat_id: int, text: str, reply_markup=None) -> int:
+    async def send(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup=None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
+    ) -> int:
         self.next_id += 1
         self.sent.append((chat_id, text, reply_markup))
+        self.send_metadata.append((screen, reason))
         return self.next_id
 
-    async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup=None) -> None:
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup=None,
+        *,
+        screen: str | None = None,
+        reason: str = "navigation",
+    ) -> None:
         if self.fail_edit:
             error, self.fail_edit = self.fail_edit, None
             raise error
         self.edits.append((chat_id, message_id, text, reply_markup))
+        self.edit_metadata.append((screen, reason))
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
