@@ -1164,6 +1164,33 @@ class TelegramBot:
             return True
         return False
 
+    async def _dispatch_legacy_settings_callback(self, data: list[str], reply) -> bool:
+        """Keep pre-v1 settings and error-cleanup buttons working."""
+        if len(data) == 3 and data[0] == "settings" and data[1] == "set":
+            try:
+                self.set_schedule_mode(data[2])
+            except ValueError:
+                await reply("Неизвестный режим расписания.")
+                return True
+            await reply(f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard(self.notifications_enabled()))
+            return True
+        if data == ["settings", "notifications", "toggle"]:
+            enabled = not self.notifications_enabled()
+            self.set_notifications_enabled(enabled)
+            await reply(
+                f"{'🔔 Уведомления включены' if enabled else '🔕 Уведомления выключены'}.",
+                settings_keyboard(enabled),
+            )
+            return True
+        if data == ["errors", "clear", "cancel"]:
+            await reply("Очистка журнала ошибок отменена.")
+            return True
+        if data == ["errors", "clear", "confirm"]:
+            deleted = await asyncio.to_thread(self.clear_errors)
+            await reply(f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
+            return True
+        return False
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1281,6 +1308,8 @@ class TelegramBot:
             return
         if not is_admin(sender_id, settings.telegram_admin_id):
             return
+        if await self._dispatch_legacy_settings_callback(data, reply):
+            return
         if await self._dispatch_legacy_scan_callback(data, reply):
             return
         if len(data) == 3 and data[0] == "v1" and data[1] == "access":
@@ -1288,29 +1317,6 @@ class TelegramBot:
             return
         if data == ["menu", "main"]:
             await reply("Главное меню готово. Выберите действие:")
-            return
-        if len(data) == 3 and data[0] == "settings" and data[1] == "set":
-            try:
-                self.set_schedule_mode(data[2])
-            except ValueError:
-                await reply("Неизвестный режим расписания.")
-                return
-            await reply(f"✅ Расписание изменено: {schedule_label(data[2])}.", settings_keyboard(self.notifications_enabled()))
-            return
-        if data == ["settings", "notifications", "toggle"]:
-            enabled = not self.notifications_enabled()
-            self.set_notifications_enabled(enabled)
-            await reply(
-                f"{'🔔 Уведомления включены' if enabled else '🔕 Уведомления выключены'}.",
-                settings_keyboard(enabled),
-            )
-            return
-        if data == ["errors", "clear", "cancel"]:
-            await reply("Очистка журнала ошибок отменена.")
-            return
-        if data == ["errors", "clear", "confirm"]:
-            deleted = await asyncio.to_thread(self.clear_errors)
-            await reply(f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
             return
         if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
             result = await asyncio.to_thread(self.toggle_ignored_category, data[2])

@@ -337,6 +337,24 @@ def test_settings_callback_changes_mode_and_confirms(monkeypatch):
     assert any("Расписание изменено" in args[1] for args in sent)
 
 
+def test_legacy_settings_callback_adapter_handles_toggle():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.notifications_enabled = lambda: True
+    bot.set_notifications_enabled = lambda enabled: setattr(bot, "saved_enabled", enabled)
+    replies = []
+
+    async def reply(text, markup=None, fallback_chat_id=None):
+        replies.append((text, markup, fallback_chat_id))
+
+    handled = asyncio.run(bot._dispatch_legacy_settings_callback(["settings", "notifications", "toggle"], reply))
+
+    assert handled is True
+    assert bot.saved_enabled is False
+    assert replies and "Уведомления выключены" in replies[0][0]
+
+
 def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     import asyncio
 
