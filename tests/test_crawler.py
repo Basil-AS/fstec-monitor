@@ -209,7 +209,7 @@ def test_unchanged_document_does_not_create_new_snapshot(monkeypatch, tmp_path):
         assert session.scalar(select(func.count(Snapshot.id))) == 1
 
 
-def test_recent_attachment_audit_is_not_repeated_for_unchanged_document(monkeypatch, tmp_path):
+def test_attachment_audit_is_repeated_to_catch_file_updates(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/attachment-audit.db")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -230,10 +230,62 @@ def test_recent_attachment_audit_is_not_repeated_for_unchanged_document(monkeypa
         monitor.process_attachment = tracked_process_attachment
         url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
         await monitor.process_document(url, baseline=True)
+        with session_factory() as session:
+            assert session.scalar(select(func.count(Attachment.id))) == 1
+            assert session.scalar(select(Attachment.active)) is True
         await monitor.process_document(url)
         return calls
 
-    assert asyncio.run(run()) == 1
+    assert asyncio.run(run()) == 2
+
+
+def test_attachment_audit_runs_when_document_page_is_not_modified(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/attachment-304.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    class _Page304Fetcher(_FakeFetcher):
+        page_calls = 0
+
+        async def get(self, url, headers=None, **kwargs):
+            if url.endswith("/doc"):
+                self.page_calls += 1
+                if self.page_calls > 1:
+                    return SimpleNamespace(status_code=304, text="", content=b"", url=url, headers={})
+            return await super().get(url, headers=headers, **kwargs)
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = _Page304Fetcher(_HTML)
+        calls = 0
+        cached_audits = 0
+
+        async def tracked_process_attachment(_session, _document, _attachment, _baseline):
+            nonlocal calls
+            calls += 1
+
+        monitor.process_attachment = tracked_process_attachment
+        original_cached_audit = monitor._audit_cached_attachments
+
+        async def tracked_cached_audit(session, document, now):
+            nonlocal cached_audits
+            cached_audits += 1
+            return await original_cached_audit(session, document, now)
+
+        monitor._audit_cached_attachments = tracked_cached_audit
+        url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
+        await monitor.process_document(url, baseline=True)
+        with session_factory() as session:
+            assert session.scalar(select(func.count(Attachment.id))) == 1
+            assert session.scalar(select(Attachment.active)) is True
+            attachment = session.scalar(select(Attachment))
+            assert crawler.preferred_attachment_urls([attachment]) == {attachment.url}
+        await monitor.process_document(url)
+        return calls, cached_audits
+
+    assert asyncio.run(run()) == (2, 1)
 
 
 def test_new_document_emits_one_document_event_not_attachment_flood(monkeypatch, tmp_path):
