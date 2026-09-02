@@ -355,6 +355,21 @@ def test_legacy_settings_callback_adapter_handles_toggle():
     assert replies and "Уведомления выключены" in replies[0][0]
 
 
+def test_legacy_admin_callback_adapter_handles_main_menu():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    replies = []
+
+    async def reply(text, markup=None, fallback_chat_id=None):
+        replies.append((text, markup, fallback_chat_id))
+
+    handled = asyncio.run(bot._dispatch_legacy_admin_callback(["menu", "main"], reply))
+
+    assert handled is True
+    assert replies == [("Главное меню готово. Выберите действие:", None, None)]
+
+
 def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     import asyncio
 
