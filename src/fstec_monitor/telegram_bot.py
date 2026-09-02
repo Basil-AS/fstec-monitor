@@ -220,7 +220,9 @@ class TelegramBot:
             }
             if has_html_markup(text):
                 payload["parse_mode"] = "HTML"
-            if reply_markup is not None:
+            # A split response is one logical message: keep actionable buttons
+            # only on its tail fragment so navigation never gets duplicated.
+            if reply_markup is not None and start + 3900 >= len(text):
                 payload["reply_markup"] = reply_markup
             self._log_tgux("sendMessage", payload, screen=screen, reason=reason)
             result = await self.call("sendMessage", payload)
