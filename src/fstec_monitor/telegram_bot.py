@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from .access import access_request_text, is_allowed
 from .config import settings
@@ -789,8 +789,8 @@ class TelegramBot:
         if should_notify:
             await self.send(settings.telegram_admin_id, access_request_text(user_id, username, display_name), {
                 "inline_keyboard": [[
-                    {"text": "✅ Разрешить", "callback_data": f"access:approve:{user_id}"},
-                    {"text": "❌ Отклонить", "callback_data": f"access:deny:{user_id}"},
+                    {"text": "✅ Разрешить", "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user_id}")},
+                    {"text": "❌ Отклонить", "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user_id}")},
                 ]]
             })
             with SessionLocal() as session:
@@ -1011,6 +1011,47 @@ class TelegramBot:
                 return True
         return False
 
+    async def _handle_access_decision(self, value: str, reply) -> None:
+        """Settle an access request exactly once and close its action buttons."""
+        try:
+            decision, raw_user_id = value.split("-", 1)
+            user_id = int(raw_user_id)
+        except (ValueError, AttributeError):
+            await reply("Заявка устарела.", {"inline_keyboard": []})
+            return
+        if decision not in {"approve", "deny"} or user_id <= 0:
+            await reply("Заявка устарела.", {"inline_keyboard": []})
+            return
+
+        status = "approved" if decision == "approve" else "denied"
+        target_chat = None
+        with SessionLocal() as session:
+            user = session.get(UserAccess, user_id)
+            if not user:
+                await reply("Заявка уже недоступна.", {"inline_keyboard": []})
+                return
+            result = session.execute(
+                update(UserAccess)
+                .where(UserAccess.user_id == user_id, UserAccess.status == "pending")
+                .values(status=status, reviewed_at=datetime.now(UTC))
+            )
+            if result.rowcount != 1:
+                verdict = "разрешён" if user.status == "approved" else "отклонён"
+                await reply(f"Решение уже принято: доступ {verdict}.", {"inline_keyboard": []})
+                return
+            target_chat = user.chat_id
+            session.commit()
+
+        if target_chat:
+            await self.send(
+                target_chat,
+                "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.",
+            )
+        await reply(
+            f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.",
+            {"inline_keyboard": []},
+        )
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1105,6 +1146,9 @@ class TelegramBot:
             return
         if not is_admin(sender_id, settings.telegram_admin_id):
             return
+        if len(data) == 3 and data[0] == "v1" and data[1] == "access":
+            await self._handle_access_decision(data[2], reply)
+            return
         if data == ["menu", "main"]:
             await reply("Главное меню готово. Выберите действие:")
             return
@@ -1184,19 +1228,7 @@ class TelegramBot:
             return
         if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
             return
-        user_id = int(data[2])
-        status = "approved" if data[1] == "approve" else "denied"
-        with SessionLocal() as session:
-            user = session.get(UserAccess, user_id)
-            if not user:
-                await reply(f"Пользователь {user_id} не найден.")
-                return
-            user.status = status
-            user.reviewed_at = datetime.now(UTC)
-            session.commit()
-            target_chat = user.chat_id
-        await self.send(target_chat, "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.")
-        await reply(f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.")
+        await self._handle_access_decision(f"{data[1]}-{data[2]}", reply)
 
     def _build_report(self, event_id: int) -> tuple[str, list[tuple[str, bytes, str]]] | None:
         store = ObjectStore()
