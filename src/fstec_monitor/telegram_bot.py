@@ -1092,9 +1092,21 @@ class TelegramBot:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
         raw_data = callback.get("data") or ""
+        callback_message = callback.get("message") or {}
+        callback_chat_id = (callback_message.get("chat") or {}).get("id")
+        callback_message_id = callback_message.get("message_id")
+        lifecycle = getattr(self, "lifecycle", None)
+        stale_callback = bool(
+            lifecycle is not None
+            and callback_chat_id
+            and callback_message_id
+            and not lifecycle.is_media_message(callback_message)
+            and lifecycle.session(callback_chat_id).message_id is not None
+            and not lifecycle.is_current_screen_message(callback_chat_id, callback_message_id)
+        )
         if callback_id:
             try:
-                toast = self._callback_toast(raw_data)
+                toast = "Экран устарел" if stale_callback else self._callback_toast(raw_data)
                 if raw_data in {"v1:scan:run", "v1:scan:retry"} and self.scan_is_running():
                     toast = "Уже выполняется"
                 elif raw_data == "v1:scan:stop" and not self.scan_is_running():
@@ -1147,6 +1159,13 @@ class TelegramBot:
         message_id = message.get("message_id")
         lifecycle = getattr(self, "lifecycle", None)
         if lifecycle is not None and chat_id and message_id:
+            if (
+                not lifecycle.is_media_message(message)
+                and lifecycle.session(chat_id).message_id is not None
+                and not lifecycle.is_current_screen_message(chat_id, message_id)
+            ):
+                log.info("ignoring stale callback chat=%s message=%s", chat_id, message_id)
+                return
             lifecycle.adopt_screen(chat_id, message_id, self._navigation_stack(chat_id).current, message=message)
         if decoded:
             action, value = decoded

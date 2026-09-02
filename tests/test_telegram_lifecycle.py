@@ -175,6 +175,20 @@ def test_stale_tail_creates_one_new_screen_instead_of_editing_history() -> None:
     asyncio.run(scenario())
 
 
+def test_stale_screen_message_is_not_current_chat_tail() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        current = await lifecycle.show_screen(7, "main", "main", None)
+        lifecycle.remember_message(7, 102, context=True)
+
+        assert current == 101
+        assert not lifecycle.is_current_screen_message(7, current)
+        assert lifecycle.is_current_screen_message(7, 102) is False
+
+    asyncio.run(scenario())
+
+
 def test_media_trigger_is_never_deleted_and_menu_is_recreated_below_it() -> None:
     async def scenario() -> None:
         transport = FakeTransport()
