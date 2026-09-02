@@ -239,6 +239,28 @@ def test_attachment_audit_is_repeated_to_catch_file_updates(monkeypatch, tmp_pat
     assert asyncio.run(run()) == 2
 
 
+def test_new_document_does_not_report_its_initial_attachments(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/initial-attachments.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    async def run():
+        monitor = Monitor()
+        monitor.fetcher = _FakeFetcher(_HTML)
+        await monitor.process_document(
+            "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc",
+            baseline=False,
+        )
+
+    asyncio.run(run())
+    with session_factory() as session:
+        assert [event.kind for event in session.scalars(select(Event).order_by(Event.id)).all()] == [
+            "document_added"
+        ]
+
+
 def test_attachment_audit_runs_when_document_page_is_not_modified(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/attachment-304.db")
     Base.metadata.create_all(engine)
