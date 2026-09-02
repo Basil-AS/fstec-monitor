@@ -1411,7 +1411,7 @@ class TelegramBot:
         elif command in {"/report", "/diff"}:
             event_id = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else await asyncio.to_thread(self.latest_change_id)
             if event_id is None:
-                await self.send(chat_id, "Изменений для отчёта пока нет.")
+                await self.send_temporary(chat_id, "Изменений для отчёта пока нет.", ttl=8)
             else:
                 await self.send_report(chat_id, event_id)
         elif command == "/errors":

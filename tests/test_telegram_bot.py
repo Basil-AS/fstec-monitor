@@ -1102,6 +1102,24 @@ def test_report_without_id_uses_latest_meaningful_change(tmp_db):
     assert reports == [event_id]
 
 
+def test_report_without_history_uses_temporary_feedback(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    temporary = []
+    bot.latest_change_id = lambda: None
+
+    async def send_temporary(*args, **kwargs):
+        temporary.append((args, kwargs))
+
+    bot.send_temporary = send_temporary
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 1)
+
+    asyncio.run(bot._dispatch_command("/report", ["/report"], 1, 1))
+
+    assert temporary and "Изменений для отчёта пока нет" in temporary[0][0][1]
+
+
 def test_scan_requires_confirmation_and_callback_starts_it():
     import asyncio
 
