@@ -15,6 +15,7 @@ from fstec_monitor.notify import (
 )
 from fstec_monitor.reports import event_report, event_report_md
 from fstec_monitor.storage import ObjectStore
+from fstec_monitor.telegram.lifecycle import MessageLifecycleManager
 from fstec_monitor.telegram_bot import (
     ScanProgress,
     TelegramBot,
@@ -379,6 +380,38 @@ def test_duplicate_scan_callback_uses_already_running_toast():
     assert calls[0] == ("answerCallbackQuery", {
         "callback_query_id": "callback-duplicate-scan",
         "text": "Уже выполняется",
+    })
+
+
+def test_stale_callback_is_acknowledged_but_does_not_dispatch():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.lifecycle = MessageLifecycleManager(SimpleNamespace())
+    bot.lifecycle.remember_message(151599744, 101, screen="main")
+    bot.lifecycle.remember_message(151599744, 102, context=True)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return {}
+
+    async def unexpected_render(*_args, **_kwargs):
+        raise AssertionError("stale callback was dispatched")
+
+    bot.call = call
+    bot._render_screen = unexpected_render
+
+    asyncio.run(bot.handle_callback({
+        "id": "callback-stale",
+        "from": {"id": 151599744},
+        "message": {"message_id": 101, "chat": {"id": 151599744}},
+        "data": "v1:menu:main",
+    }))
+
+    assert calls[0] == ("answerCallbackQuery", {
+        "callback_query_id": "callback-stale",
+        "text": "Экран устарел",
     })
 
 

@@ -99,6 +99,16 @@ class MessageLifecycleManager:
         known_tail = self.session(chat_id).last_message_id
         return known_tail is None or message_id >= known_tail
 
+    def is_current_screen_message(self, chat_id: int, message_id: int | None) -> bool:
+        """Return true only for the reusable screen that is still at chat tail."""
+        session = self.session(chat_id)
+        return (
+            message_id is not None
+            and message_id == session.message_id
+            and message_id not in session.persistent_message_ids
+            and self.is_chat_tail(chat_id, message_id)
+        )
+
     def adopt_screen(
         self,
         chat_id: int,
