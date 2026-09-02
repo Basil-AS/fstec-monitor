@@ -285,8 +285,12 @@ def test_non_admin_restricted_command_uses_temporary_feedback(monkeypatch):
     async def send(*args, **kwargs):
         regular.append((args, kwargs))
 
+    async def send_chat_action(*_args, **_kwargs):
+        return None
+
     bot.send_temporary = send_temporary
     bot.send = send
+    bot.send_chat_action = send_chat_action
     monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 1)
 
     asyncio.run(bot._dispatch_command("/scan", ["/scan"], 42, 42))
@@ -1021,6 +1025,49 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     assert "-old line" in md and "+new line" in md
     assert "old-Doc.txt" in by_name and "new-Doc.txt" in by_name
     assert (tmp_path / "objects" / "reports" / f"event-{event_id}.md").read_text() == md
+
+
+def test_missing_report_uses_temporary_feedback(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    temporary = []
+    regular = []
+    bot._build_report = lambda _event_id: None
+
+    async def send_temporary(*args, **kwargs):
+        temporary.append((args, kwargs))
+
+    async def send(*args, **kwargs):
+        regular.append((args, kwargs))
+
+    bot.send_temporary = send_temporary
+    bot.send = send
+    bot.send_chat_action = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+    asyncio.run(bot.send_report(123, 999))
+
+    assert regular == []
+    assert temporary and "не найдено" in temporary[0][0][1]
+
+
+def test_missing_report_versions_use_temporary_feedback(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    temporary = []
+    bot._build_report = lambda _event_id: ("# report", [])
+    bot.send_file = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+    async def send_temporary(*args, **kwargs):
+        temporary.append((args, kwargs))
+
+    bot.send_temporary = send_temporary
+    bot.send_chat_action = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+    asyncio.run(bot.send_report(123, 999))
+
+    assert temporary and "файл отсутствует" in temporary[0][0][1]
 
 
 def test_report_without_id_uses_latest_meaningful_change(tmp_db):
