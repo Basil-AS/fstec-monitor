@@ -515,8 +515,11 @@ class TelegramBot:
                 f"⚠️ Ошибка в операции: {context}. Подробности записаны в журнал.",
                 ttl=20,
             )
-        except Exception:
-            log.exception("could not notify admin about error")
+        except Exception as notify_exc:  # noqa: BLE001 — reporting must never amplify an outage
+            # The original operation already has a concise warning above. A failed
+            # notification is expected during Telegram/network outages; logging a
+            # second traceback only floods the journal and obscures the root error.
+            log.warning("could not notify admin about error (%s)", type(notify_exc).__name__)
 
     async def quota_status(self) -> tuple[int, int]:
         now = time.monotonic()
