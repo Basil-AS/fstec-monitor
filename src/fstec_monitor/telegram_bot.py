@@ -1205,6 +1205,18 @@ class TelegramBot:
             return True
         return False
 
+    async def _dispatch_legacy_user_callback(self, data: list[str], sender_id: int | None, reply) -> bool:
+        """Keep pre-v1 personal category-filter buttons working for approved users."""
+        if len(data) != 3 or data[:2] != ["userignore", "t"]:
+            return False
+        with SessionLocal() as session:
+            user = session.get(UserAccess, sender_id) if sender_id else None
+        if not is_allowed(user):
+            return True
+        result = await asyncio.to_thread(self.toggle_user_ignored_category, sender_id, data[2])
+        await reply(result or "Категория не найдена — откройте раздел заново.", fallback_chat_id=sender_id)
+        return True
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1299,13 +1311,7 @@ class TelegramBot:
                 action, value, chat_id, sender_id, message, message_id, reply
             ):
                 return
-        if len(data) == 3 and data[0] == "userignore" and data[1] == "t":
-            with SessionLocal() as session:
-                user = session.get(UserAccess, sender_id) if sender_id else None
-            if not is_allowed(user):
-                return
-            result = await asyncio.to_thread(self.toggle_user_ignored_category, sender_id, data[2])
-            await reply(result or "Категория не найдена — откройте раздел заново.", fallback_chat_id=sender.get("id"))
+        if await self._dispatch_legacy_user_callback(data, sender_id, reply):
             return
         if decoded and decoded[0] in {"ignore", "userignore"}:
             action, token = decoded
