@@ -34,6 +34,13 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_report_command_description_allows_latest_event_default():
+    commands = {item["command"]: item["description"] for item in telegram_commands()}
+
+    assert "последн" in commands["report"].casefold()
+    assert "id" in commands["report"].casefold()
+
+
 def test_help_command_dispatches_to_help_screen():
     import asyncio
 
