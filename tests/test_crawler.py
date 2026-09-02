@@ -513,6 +513,24 @@ def test_run_monitor_records_failed_scan_run(monkeypatch, tmp_path):
         assert session.scalar(select(func.count(Event.id)).where(Event.kind == "fetch_error")) == 1
 
 
+def test_run_monitor_releases_lock_when_monitor_initialization_fails(monkeypatch, tmp_path):
+    session_factory = _scan_db(monkeypatch, tmp_path, _FakeMonitor)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    class FailingMonitor:
+        def __init__(self):
+            raise RuntimeError("http client init failed")
+
+    monkeypatch.setattr(crawler, "Monitor", FailingMonitor)
+    with pytest.raises(RuntimeError, match="http client init failed"):
+        asyncio.run(crawler.run_monitor())
+
+    monkeypatch.setattr(crawler, "Monitor", _FakeMonitor)
+    assert asyncio.run(crawler.run_monitor()) == 0
+    with session_factory() as session:
+        assert session.scalar(select(func.count(ScanRun.id))) == 2
+
+
 def test_run_monitor_logs_url_for_isolated_document_failure(monkeypatch, tmp_path, caplog):
     _scan_db(monkeypatch, tmp_path, None)
     url = "https://example.test/broken-document"
