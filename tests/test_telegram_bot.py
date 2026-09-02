@@ -672,6 +672,7 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     monkeypatch.setattr(telegram_bot_module, "ObjectStore", lambda: store)
     bot = TelegramBot.__new__(TelegramBot)
     files = []
+    actions = []
 
     async def send_file(_chat_id, name, data, caption=""):
         files.append((name, data))
@@ -679,12 +680,17 @@ def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch
     async def send(*_args, **_kwargs):
         return None
 
+    async def send_chat_action(chat_id, action):
+        actions.append((chat_id, action))
+
     bot.send_file = send_file
     bot.send = send
+    bot.send_chat_action = send_chat_action
 
     import asyncio
     asyncio.run(bot.send_report(123, event_id))
 
+    assert actions == [(123, "upload_document")]
     by_name = dict(files)
     assert f"diff_{event_id}.md" in by_name
     md = by_name[f"diff_{event_id}.md"].decode()
