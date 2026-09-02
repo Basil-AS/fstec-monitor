@@ -1376,14 +1376,18 @@ class TelegramBot:
             await send_chat_action(chat_id, "upload_document")
         result = await asyncio.to_thread(self._build_report, event_id)
         if result is None:
-            await self.send(chat_id, f"Событие #{event_id} не найдено.")
+            await self.send_temporary(chat_id, f"Событие #{event_id} не найдено.", ttl=8)
             return
         report, files = result
         await self.send_file(chat_id, f"diff_{event_id}.md", report.encode(), "Подробный отчёт: old/new и diff")
         for name, data, caption in files:
             await self.send_file(chat_id, name, data, caption)
         if not files:
-            await self.send(chat_id, "Старую/новую версию не отправил: файл отсутствует или превышает лимит Telegram. История сохранена на сервере.")
+            await self.send_temporary(
+                chat_id,
+                "Старую/новую версию не отправил: файл отсутствует или превышает лимит Telegram. История сохранена на сервере.",
+                ttl=12,
+            )
 
     async def _dispatch_command(self, command: str, parts: list[str], chat_id: int, sender_id: int | None) -> None:
         """Route an authorized command to its screen or persistent operation."""
