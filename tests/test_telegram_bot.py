@@ -171,6 +171,26 @@ def test_scan_progress_refresh_swallows_transport_failure_without_losing_state()
     assert bot.scan_status_message == (123, 77)
 
 
+def test_scan_progress_rebinds_pointer_when_deleted_ui_is_recreated():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_status_message = (123, 77)
+    bot.scan_progress = ScanProgress(state="running", stage="Документы")
+
+    class _Lifecycle:
+        def adopt_screen(self, *_args, **_kwargs):
+            return None
+
+        async def show_progress(self, *_args, **_kwargs):
+            return 88
+
+    bot.lifecycle = _Lifecycle()
+    asyncio.run(bot.refresh_scan_status())
+
+    assert bot.scan_status_message == (123, 88)
+
+
 def test_temporary_message_is_deleted_after_ttl():
     import asyncio
 

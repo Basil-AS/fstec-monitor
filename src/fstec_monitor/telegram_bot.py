@@ -466,7 +466,9 @@ class TelegramBot:
         if lifecycle is not None:
             lifecycle.adopt_screen(chat_id, message_id, "scan")
             try:
-                await lifecycle.show_progress(chat_id, text, markup)
+                refreshed_message_id = await lifecycle.show_progress(chat_id, text, markup)
+                if isinstance(refreshed_message_id, int):
+                    self.scan_status_message = (chat_id, refreshed_message_id)
             except (OSError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
                 log.debug("scan status message cannot be updated: %s", exc)
             return
