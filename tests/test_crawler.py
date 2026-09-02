@@ -32,6 +32,28 @@ def test_category_key_normalizes_nbsp_and_case():
     assert category_key("  Информационные   и аналитические материалы ") == "информационные и аналитические материалы"
 
 
+def test_repeated_attachment_error_is_recorded_once_but_changed_error_is_kept(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/error-dedup.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+
+    monitor = Monitor.__new__(Monitor)
+    with session_factory() as session:
+        document = Document(canonical_url="https://example.test/doc", title="Doc")
+        session.add(document)
+        session.flush()
+        monitor.event(session, document, "fetch_error", "warning", "ошибка вложения: report.odt", "timeout")
+        monitor.event(session, document, "fetch_error", "warning", "ошибка вложения: report.odt", "timeout")
+        monitor.event(session, document, "fetch_error", "warning", "ошибка вложения: report.odt", "connection reset")
+        session.commit()
+
+        events = session.scalars(select(Event).order_by(Event.id)).all()
+
+    assert len(events) == 2
+    assert events[1].details == "connection reset"
+
+
 def test_scan_lock_rejects_a_second_process(monkeypatch, tmp_path):
     monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
     first = acquire_scan_lock()
