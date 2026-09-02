@@ -1191,6 +1191,20 @@ class TelegramBot:
             return True
         return False
 
+    async def _dispatch_legacy_admin_callback(self, data: list[str], reply) -> bool:
+        """Keep pre-v1 admin menu, filter, and access buttons working."""
+        if data == ["menu", "main"]:
+            await reply("Главное меню готово. Выберите действие:")
+            return True
+        if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
+            result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
+            await reply(result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
+            return True
+        if len(data) == 3 and data[0] == "access" and data[1] in {"approve", "deny"} and data[2].isdigit():
+            await self._handle_access_decision(f"{data[1]}-{data[2]}", reply)
+            return True
+        return False
+
     async def handle_callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
@@ -1312,19 +1326,12 @@ class TelegramBot:
             return
         if await self._dispatch_legacy_scan_callback(data, reply):
             return
+        if await self._dispatch_legacy_admin_callback(data, reply):
+            return
         if len(data) == 3 and data[0] == "v1" and data[1] == "access":
             await self._handle_access_decision(data[2], reply)
             return
-        if data == ["menu", "main"]:
-            await reply("Главное меню готово. Выберите действие:")
-            return
-        if len(data) == 3 and data[0] == "ignore" and data[1] == "t":
-            result = await asyncio.to_thread(self.toggle_ignored_category, data[2])
-            await reply(result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
-            return
-        if len(data) != 3 or data[0] != "access" or data[1] not in {"approve", "deny"} or not data[2].isdigit():
-            return
-        await self._handle_access_decision(f"{data[1]}-{data[2]}", reply)
+        return
 
     def _build_report(self, event_id: int) -> tuple[str, list[tuple[str, bytes, str]]] | None:
         store = ObjectStore()
