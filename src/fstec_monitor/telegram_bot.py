@@ -805,8 +805,8 @@ class TelegramBot:
         return (f"В журнале ошибок {count} событий (fetch_error, storage_error).\n"
                 "Удалить их? История документов и diff'ы не затрагивается."), {
             "inline_keyboard": [[
-                {"text": "🧹 Очистить", "callback_data": "errors:clear:confirm"},
-                {"text": "Отмена", "callback_data": "errors:clear:cancel"},
+                {"text": "🧹 Очистить", "callback_data": telegram_keyboards.encode_callback("errors", "clear-confirm")},
+                {"text": "Отмена", "callback_data": telegram_keyboards.encode_callback("errors", "clear-cancel")},
             ]]
         }
 
@@ -1061,6 +1061,14 @@ class TelegramBot:
             if value == "notifications":
                 self.set_notifications_enabled(not self.notifications_enabled())
                 await self._render_screen(chat_id or sender_id, "settings", reset=True)
+                return True
+        if action == "errors":
+            if value == "clear-cancel":
+                await reply("Очистка журнала ошибок отменена.")
+                return True
+            if value == "clear-confirm":
+                deleted = await asyncio.to_thread(self.clear_errors)
+                await reply(f"🧹 Журнал ошибок очищен: удалено {deleted} событий.")
                 return True
         return False
 

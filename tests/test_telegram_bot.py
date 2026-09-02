@@ -763,13 +763,51 @@ def test_clear_errors_removes_only_error_events(tmp_db):
 
     text, markup = bot.clear_errors_text()
     assert "2 событий" in text
-    assert markup["inline_keyboard"][0][0]["callback_data"] == "errors:clear:confirm"
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "v1:errors:clear-confirm"
 
     assert bot.clear_errors() == 2
     with tmp_db() as session:
         remaining = [e.kind for e in session.scalars(select(Event)).all()]
     assert remaining == ["document_added"]
-    assert bot.clear_errors_text()[1] is None
+
+
+def test_clear_errors_confirmation_uses_versioned_callback_protocol(tmp_db):
+    with tmp_db() as session:
+        session.add(Event(kind="fetch_error", summary="Ошибка загрузки", details="temporary"))
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+
+    _, markup = bot.clear_errors_text()
+
+    callbacks = [button["callback_data"] for row in (markup or {}).get("inline_keyboard", []) for button in row]
+    assert callbacks == ["v1:errors:clear-confirm", "v1:errors:clear-cancel"]
+
+
+def test_versioned_clear_errors_callback_is_dispatched_without_new_message():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    rendered = []
+    replies = []
+
+    async def render(*args, **kwargs):
+        rendered.append((args, kwargs))
+        return 1
+
+    async def reply(text, markup=None, fallback_chat_id=None):
+        replies.append((text, markup, fallback_chat_id))
+
+    bot._render_screen = render
+    bot.clear_errors = lambda: 3
+
+    handled = asyncio.run(
+        bot._dispatch_decoded_callback("errors", "clear-confirm", 7, 7, {}, None, reply)
+    )
+
+    assert handled is True
+    assert replies == [("🧹 Журнал ошибок очищен: удалено 3 событий.", None, None)]
+    assert rendered == []
 
 
 def test_ignore_toggle_persists_category(tmp_db):
