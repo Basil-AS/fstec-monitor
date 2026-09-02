@@ -40,7 +40,7 @@ from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
-from .telegram.rendering import has_html_markup, render_scan_progress
+from .telegram.rendering import escape_html, has_html_markup, render_scan_progress
 from .telegram.ux.callbacks import CallbackCodec
 from .telegram.ux.messages import MessageLedger
 from .telegram.ux.models import ViewModel
@@ -586,18 +586,52 @@ class TelegramBot:
         if not events:
             return "Изменений нет."
         lines = ["📰 Последние изменения"]
-        grouped: dict[tuple[str, int | None], list[Event]] = {}
+        grouped: dict[str, dict[int | None, list[Event]]] = {}
         for event in events:
             document = docs.get(event.document_id) if event.document_id else None
             category = document.category if document and document.category else "Без категории"
-            grouped.setdefault((category, event.document_id), []).append(event)
-        for (category, document_id), grouped_events in grouped.items():
-            document = docs.get(document_id) if document_id else None
-            title = document.title if document else "Общие события"
-            lines.append(f"\n📁 {category}\n<b>{title}</b>")
-            ordered = sorted(grouped_events, key=lambda event: (event.kind != "document_added", event.id))
-            for event in ordered:
-                lines.append(f"• #{event.id} {_dt(event.created_at)} — {event.summary}")
+            grouped.setdefault(category, {}).setdefault(event.document_id, []).append(event)
+        for category, documents in sorted(grouped.items(), key=lambda item: item[0].casefold()):
+            visible_documents: list[tuple[int | None, list[Event]]] = []
+            for document_id, document_events in documents.items():
+                has_document_added = any(event.kind == "document_added" for event in document_events)
+                visible = [
+                    event for event in document_events
+                    if not (has_document_added and event.kind == "attachment_added")
+                ]
+                # A document may expose both ODT and PDF links. If there is no
+                # document_added event, retain one user-facing attachment event
+                # per filename family while still auditing both variants.
+                attachment_events: dict[str, Event] = {}
+                compact: list[Event] = []
+                for event in visible:
+                    if event.kind != "attachment_added":
+                        compact.append(event)
+                        continue
+                    title = event.summary.partition(":")[2].strip().casefold()
+                    for suffix in (".odt", ".pdf"):
+                        if title.endswith(suffix):
+                            title = title[: -len(suffix)].rstrip(" ._-–—")
+                            break
+                    previous = attachment_events.get(title)
+                    if previous is None or event.summary.casefold().endswith(".odt"):
+                        attachment_events[title] = event
+                visible = [*compact, *attachment_events.values()]
+                if visible:
+                    visible_documents.append((document_id, sorted(visible, key=lambda event: (event.kind != "document_added", event.id))))
+            if not visible_documents:
+                continue
+            lines.append(f"\n📁 {escape_html(category)}")
+            for document_id, grouped_events in sorted(
+                visible_documents,
+                key=lambda item: max((event.id or 0) for event in item[1]),
+                reverse=True,
+            ):
+                document = docs.get(document_id) if document_id else None
+                title = document.title if document else "Общие события"
+                lines.append(f"<b>{escape_html(title)}</b>")
+                for event in grouped_events:
+                    lines.append(f"• #{event.id} {_dt(event.created_at)} — {escape_html(event.summary)}")
         lines.append("\nДля полного Markdown-отчёта: /report (без ID — последнее событие).")
         return "\n".join(lines)
 
