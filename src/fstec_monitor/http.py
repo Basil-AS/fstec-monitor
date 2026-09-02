@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import random
+from urllib.parse import urlparse
 
 import httpx
 
 from .config import settings
+
+_ATTACHMENT_SUFFIXES = (".odt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".zip", ".rar", ".7z")
+
+
+def request_timeout(url: str) -> float:
+    """Use the larger configured read budget for binary attachments."""
+    if urlparse(url).path.casefold().endswith(_ATTACHMENT_SUFFIXES):
+        return settings.attachment_timeout_seconds
+    return settings.document_timeout_seconds
 
 
 def conditional_headers(etag: str = "", last_modified: str = "") -> dict[str, str]:
@@ -33,7 +43,7 @@ class Fetcher:
         self.client=httpx.AsyncClient(timeout=settings.timeout_seconds, follow_redirects=True, verify=settings.tls_verify, headers={"User-Agent": settings.user_agent, "Accept-Language":"ru-RU,ru;q=0.9"}, limits=httpx.Limits(max_connections=settings.max_concurrency, max_keepalive_connections=settings.max_concurrency))
     async def close(self): await self.client.aclose()
     async def get(self,url:str, headers:dict[str, str] | None = None, *, timeout: float | None = None) -> httpx.Response:
-        total_timeout = timeout if timeout is not None else settings.timeout_seconds
+        total_timeout = timeout if timeout is not None else request_timeout(url)
         try:
             async with asyncio.timeout(total_timeout):
                 last=None
@@ -41,9 +51,7 @@ class Fetcher:
                     try:
                         delay = settings.request_delay_seconds
                         await asyncio.sleep(delay + random.random() * delay)
-                        request_kwargs = {"headers": headers}
-                        if timeout is not None:
-                            request_kwargs["timeout"] = timeout
+                        request_kwargs = {"headers": headers, "timeout": total_timeout}
                         r=await self.client.get(url, **request_kwargs)
                         if r.status_code in {429,500,502,503,504}:
                             error = httpx.HTTPStatusError("retryable", request=r.request, response=r)

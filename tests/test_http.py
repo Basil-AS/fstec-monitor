@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from fstec_monitor.http import Fetcher
+from fstec_monitor.http import Fetcher, request_timeout
 
 
 def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
@@ -28,6 +28,29 @@ def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
         asyncio.run(fetcher.get("https://example.test"))
 
     assert sleeps == [0, 5, 0]
+
+
+def test_fetcher_uses_longer_timeout_for_binary_attachments(monkeypatch):
+    calls = []
+
+    class Client:
+        async def get(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return httpx.Response(200, request=httpx.Request("GET", args[0]))
+
+    monkeypatch.setattr("fstec_monitor.http.settings.request_delay_seconds", 0)
+    monkeypatch.setattr("fstec_monitor.http.settings.max_retries", 1)
+    monkeypatch.setattr("fstec_monitor.http.settings.attachment_timeout_seconds", 120.0)
+    monkeypatch.setattr("fstec_monitor.http.settings.document_timeout_seconds", 180.0)
+    fetcher = Fetcher.__new__(Fetcher)
+    fetcher.client = Client()
+
+    asyncio.run(fetcher.get("https://example.test/file.odt"))
+    asyncio.run(fetcher.get("https://example.test/page"))
+
+    assert calls[0][1]["timeout"] == 120.0
+    assert calls[1][1]["timeout"] == 180.0
+    assert request_timeout("https://example.test/file.PDF") == 120.0
 
 
 def test_fetcher_jitter_is_bounded_by_configured_delay(monkeypatch):
