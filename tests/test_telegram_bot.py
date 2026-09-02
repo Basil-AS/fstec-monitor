@@ -167,6 +167,8 @@ def test_pending_access_request_does_not_spam_user_on_repeated_updates(tmp_db):
 
     assert len(sent) == 2
     assert sent[0][0][0] == telegram_bot_module.settings.telegram_admin_id
+    callback_data = sent[0][0][2]["inline_keyboard"][0][0]["callback_data"]
+    assert callback_data.startswith("v1:access:approve-")
     assert sent[1][0][0] == 142
 
 

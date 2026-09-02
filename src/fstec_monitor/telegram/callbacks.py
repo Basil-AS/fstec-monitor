@@ -18,6 +18,7 @@ _ALLOWED_ACTIONS: Final = {
     "screen",
     "nav",
     "userignore",
+    "access",
 }
 
 
