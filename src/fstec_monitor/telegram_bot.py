@@ -1207,10 +1207,6 @@ class TelegramBot:
                 return None
             doc = session.get(Document, event.document_id) if event.document_id else None
             report = event_report_md(event, doc.title if doc else "", doc.canonical_url if doc else "")
-            report_path = Path(settings.storage_dir) / "reports" / f"event-{event.id}.md"
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(report, encoding="utf-8")
-            log.info("persisted Markdown report event=%s path=%s", event.id, report_path)
             hashes = re.findall(r"(?:old|new)=([0-9a-f]{64})", event.details)
             if hashes:
                 versions = session.scalars(select(AttachmentVersion).where(AttachmentVersion.binary_sha256.in_(hashes))).all()

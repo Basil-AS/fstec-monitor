@@ -57,7 +57,7 @@ def category_key(value: str) -> str:
 
 def attachment_group_key(link) -> str:
     """Return a stable title key shared by ODT/PDF variants."""
-    title = category_key(link.title or "")
+    title = category_key(getattr(link, "title", "") or getattr(link, "display_name", ""))
     for suffix in ATTACHMENT_SUFFIXES:
         if title.endswith(suffix):
             title = title[: -len(suffix)].rstrip(" ._-\u2013\u2014")
@@ -198,7 +198,10 @@ class Monitor:
         # Attachment content is the actual change source. Recheck the
         # preferred ODT/PDF variant on every document fetch; binary hashes
         # make unchanged files cheap while avoiding stale attachment data.
-        audit_attachments = previous is None or previous.semantic_sha256 != text_hash or audit_due
+        # Attachment URLs can keep the same page ETag while their files change.
+        # Always issue conditional attachment requests so a changed ODT/PDF is
+        # detected on the next monitor run; unchanged files still return 304.
+        audit_attachments = True
         preferred_urls = preferred_attachment_urls(attachments)
         for link in attachments:
             attachment = session.scalar(
@@ -255,6 +258,29 @@ class Monitor:
         if audit_attachments:
             doc.last_attachment_audit_at = now
 
+    async def _audit_cached_attachments(self, session, doc, now) -> None:
+        """Audit known preferred attachments when the page itself returns 304."""
+        attachments = session.scalars(
+            select(Attachment).where(Attachment.document_id == doc.id, Attachment.active.is_(True))
+        ).all()
+        preferred_urls = preferred_attachment_urls(attachments)
+        for attachment in attachments:
+            if attachment.url not in preferred_urls:
+                continue
+            try:
+                await self.process_attachment(session, doc, attachment, False)
+            except StorageQuotaExceeded as exc:
+                self.event(
+                    session, doc, "storage_error", "critical",
+                    f"квота хранилища достигнута: {attachment.display_name}", str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001 — isolate one broken attachment
+                self.event(
+                    session, doc, "fetch_error", "warning",
+                    f"ошибка вложения: {attachment.display_name}", repr(exc),
+                )
+        doc.last_attachment_audit_at = now
+
     async def process_document(self,url:str,baseline:bool=False):
         with SessionLocal() as cached_session:
             cached_doc=cached_session.scalar(select(Document).where(Document.canonical_url==url))
@@ -268,7 +294,12 @@ class Monitor:
         r=await self.fetcher.get(url, headers=validators)
         if r.status_code==304 and cached_doc:
             with SessionLocal() as s:
-                doc=s.get(Document,cached_doc.id); doc.last_seen_at=now; doc.active=True; doc.missing_runs=0; s.commit()
+                doc=s.get(Document,cached_doc.id)
+                doc.last_seen_at=now
+                doc.active=True
+                doc.missing_runs=0
+                await self._audit_cached_attachments(s, doc, now)
+                s.commit()
             return
         r.raise_for_status(); raw=r.content
         parsed=parse_page(r.text,str(r.url),canonicalize(settings.catalog_url))
