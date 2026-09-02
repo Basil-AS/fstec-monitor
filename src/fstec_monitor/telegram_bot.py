@@ -819,43 +819,47 @@ class TelegramBot:
             return result.rowcount or 0
 
     async def request_access(self, user_id: int, chat_id: int, username: str, display_name: str) -> bool:
-        should_notify = False
-        with SessionLocal() as session:
-            user = session.get(UserAccess, user_id)
-            if user and is_allowed(user):
-                return True
-            if not user:
-                user = UserAccess(user_id=user_id, chat_id=chat_id, username=username, display_name=display_name, status="pending")
-                session.add(user)
-                should_notify = True
-            elif user.status != "pending":
-                user.status = "pending"
-                user.chat_id = chat_id
-                user.username = username
-                user.display_name = display_name
-                user.notification_sent = False
-                should_notify = True
-            else:
-                user.chat_id = chat_id
-                user.username = username
-                user.display_name = display_name
-                should_notify = not user.notification_sent
-            session.commit()
-        if should_notify:
-            await self.send(settings.telegram_admin_id, access_request_text(user_id, username, display_name), {
-                "inline_keyboard": [[
-                    {"text": "✅ Разрешить", "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user_id}")},
-                    {"text": "❌ Отклонить", "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user_id}")},
-                ]]
-            })
+        locks = getattr(self, "_access_request_locks", None)
+        if locks is None:
+            locks = self._access_request_locks = {}
+        lock = locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            should_notify = False
             with SessionLocal() as session:
                 user = session.get(UserAccess, user_id)
-                if user:
-                    user.notification_sent = True
-                    session.commit()
-        if should_notify:
-            await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения.")
-        return False
+                if user and is_allowed(user):
+                    return True
+                if not user:
+                    user = UserAccess(user_id=user_id, chat_id=chat_id, username=username, display_name=display_name, status="pending")
+                    session.add(user)
+                    should_notify = True
+                elif user.status != "pending":
+                    user.status = "pending"
+                    user.chat_id = chat_id
+                    user.username = username
+                    user.display_name = display_name
+                    user.notification_sent = False
+                    should_notify = True
+                else:
+                    user.chat_id = chat_id
+                    user.username = username
+                    user.display_name = display_name
+                    should_notify = not user.notification_sent
+                session.commit()
+            if should_notify:
+                await self.send(settings.telegram_admin_id, access_request_text(user_id, username, display_name), {
+                    "inline_keyboard": [[
+                        {"text": "✅ Разрешить", "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user_id}")},
+                        {"text": "❌ Отклонить", "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user_id}")},
+                    ]]
+                })
+                with SessionLocal() as session:
+                    user = session.get(UserAccess, user_id)
+                    if user:
+                        user.notification_sent = True
+                        session.commit()
+                await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения.")
+            return False
 
     def _navigation_stack(self, chat_id: int) -> NavigationStack:
         navigation = getattr(self, "navigation", None)

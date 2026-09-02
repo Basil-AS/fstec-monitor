@@ -235,6 +235,28 @@ def test_pending_access_request_does_not_spam_user_on_repeated_updates(tmp_db):
     assert sent[1][0][0] == 142
 
 
+def test_concurrent_pending_access_requests_notify_once(tmp_db):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append((args, kwargs))
+        await asyncio.sleep(0)
+
+    bot.send = send
+    request = {"user_id": 43, "chat_id": 143, "username": "racer", "display_name": "Racer"}
+
+    async def run():
+        await asyncio.gather(bot.request_access(**request), bot.request_access(**request))
+
+    asyncio.run(run())
+
+    assert [call[0][0] for call in sent].count(telegram_bot_module.settings.telegram_admin_id) == 1
+    assert [call[0][0] for call in sent].count(143) == 1
+
+
 def test_only_configured_admin_is_authorized():
     assert is_admin(151599744, 151599744)
     assert not is_admin(151599745, 151599744)
