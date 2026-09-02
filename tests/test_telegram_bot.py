@@ -347,6 +347,34 @@ def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     assert all(item[0] != "sendMessage" for item in calls if item[0] != "render")
 
 
+def test_duplicate_scan_callback_uses_already_running_toast():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_task = SimpleNamespace(done=lambda: False)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return {}
+
+    bot.call = call
+    bot.start_scan = lambda: False
+    bot._render_screen = lambda *args, **kwargs: asyncio.sleep(0)
+
+    asyncio.run(bot.handle_callback({
+        "id": "callback-duplicate-scan",
+        "from": {"id": 151599744},
+        "message": {"message_id": 42, "chat": {"id": 151599744}},
+        "data": "v1:scan:run",
+    }))
+
+    assert calls[0] == ("answerCallbackQuery", {
+        "callback_query_id": "callback-duplicate-scan",
+        "text": "Уже выполняется",
+    })
+
+
 def test_run_does_not_start_scan_immediately(monkeypatch):
     class StopRun(Exception):
         pass

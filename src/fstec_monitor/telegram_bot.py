@@ -1095,6 +1095,10 @@ class TelegramBot:
         if callback_id:
             try:
                 toast = self._callback_toast(raw_data)
+                if raw_data in {"v1:scan:run", "v1:scan:retry"} and self.scan_is_running():
+                    toast = "Уже выполняется"
+                elif raw_data == "v1:scan:stop" and not self.scan_is_running():
+                    toast = "Проверка уже завершена"
                 answer = getattr(self, "answer_callback", None)
                 if answer is not None:
                     await answer(callback_id, toast)
