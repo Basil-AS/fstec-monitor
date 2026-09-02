@@ -681,7 +681,16 @@ class TelegramBot:
         for user in users:
             identity = f"@{user.username}" if user.username else user.display_name or "без имени"
             lines.append(f"{identity} — ID {user.user_id}")
-            buttons.append([{"text": f"✅ {identity[:30]}", "callback_data": f"access:approve:{user.user_id}"}, {"text": "❌", "callback_data": f"access:deny:{user.user_id}"}])
+            buttons.append([
+                {
+                    "text": f"✅ {identity[:30]}",
+                    "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user.user_id}"),
+                },
+                {
+                    "text": "❌",
+                    "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user.user_id}"),
+                },
+            ])
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def ignored_categories_db(self) -> list[str]:
