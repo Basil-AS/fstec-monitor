@@ -986,6 +986,45 @@ class TelegramBot:
             return "Открываю…"
         return "Обновлено"
 
+    async def _answer_callback(self, callback_id: str | None, raw_data: str, stale: bool) -> None:
+        """Acknowledge a callback before dispatching any potentially slow work."""
+        if not callback_id:
+            return
+        toast = "Экран устарел" if stale else self._callback_toast(raw_data)
+        if raw_data in {"v1:scan:run", "v1:scan:retry"} and self.scan_is_running():
+            toast = "Уже выполняется"
+        elif raw_data == "v1:scan:stop" and not self.scan_is_running():
+            toast = "Проверка уже завершена"
+        answer = getattr(self, "answer_callback", None)
+        try:
+            if answer is not None:
+                await answer(callback_id, toast)
+            else:
+                await self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": toast})
+        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+            log.warning("answerCallbackQuery failed (expired query?): %s", exc)
+
+    def _adopt_callback_screen(self, callback: dict) -> tuple[dict, int | None, int | None, bool]:
+        """Validate callback freshness and bind its message to the lifecycle."""
+        message = callback.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        lifecycle = getattr(self, "lifecycle", None)
+        is_stale = bool(
+            lifecycle is not None
+            and chat_id
+            and message_id
+            and not lifecycle.is_media_message(message)
+            and lifecycle.session(chat_id).message_id is not None
+            and not lifecycle.is_current_screen_message(chat_id, message_id)
+        )
+        if lifecycle is not None and chat_id and message_id:
+            if is_stale:
+                log.info("ignoring stale callback chat=%s message=%s", chat_id, message_id)
+            else:
+                lifecycle.adopt_screen(chat_id, message_id, self._navigation_stack(chat_id).current, message=message)
+        return message, chat_id, message_id, is_stale
+
     async def _dispatch_decoded_callback(
         self,
         action: str,
@@ -1265,32 +1304,8 @@ class TelegramBot:
         callback_id = callback.get("id")
         sender = callback.get("from") or {}
         raw_data = callback.get("data") or ""
-        callback_message = callback.get("message") or {}
-        callback_chat_id = (callback_message.get("chat") or {}).get("id")
-        callback_message_id = callback_message.get("message_id")
-        lifecycle = getattr(self, "lifecycle", None)
-        stale_callback = bool(
-            lifecycle is not None
-            and callback_chat_id
-            and callback_message_id
-            and not lifecycle.is_media_message(callback_message)
-            and lifecycle.session(callback_chat_id).message_id is not None
-            and not lifecycle.is_current_screen_message(callback_chat_id, callback_message_id)
-        )
-        if callback_id:
-            try:
-                toast = "Экран устарел" if stale_callback else self._callback_toast(raw_data)
-                if raw_data in {"v1:scan:run", "v1:scan:retry"} and self.scan_is_running():
-                    toast = "Уже выполняется"
-                elif raw_data == "v1:scan:stop" and not self.scan_is_running():
-                    toast = "Проверка уже завершена"
-                answer = getattr(self, "answer_callback", None)
-                if answer is not None:
-                    await answer(callback_id, toast)
-                else:
-                    await self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": toast})
-            except (OSError, RuntimeError, httpx.HTTPError) as exc:
-                log.warning("answerCallbackQuery failed (expired query?): %s", exc)
+        callback_message, callback_chat_id, callback_message_id, stale_callback = self._adopt_callback_screen(callback)
+        await self._answer_callback(callback_id, raw_data, stale_callback)
 
         async def reply(text: str, markup: dict | None = None, fallback_chat_id: int | None = None) -> None:
             await self._reply_to_callback(callback, text, markup, fallback_chat_id)
@@ -1298,20 +1313,11 @@ class TelegramBot:
         sender_id = sender.get("id")
         data = raw_data.split(":")
         decoded = decode_callback(raw_data)
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        message_id = message.get("message_id")
-        lifecycle = getattr(self, "lifecycle", None)
-        if lifecycle is not None and chat_id and message_id:
-            if (
-                not lifecycle.is_media_message(message)
-                and lifecycle.session(chat_id).message_id is not None
-                and not lifecycle.is_current_screen_message(chat_id, message_id)
-            ):
-                log.info("ignoring stale callback chat=%s message=%s", chat_id, message_id)
-                return
-            lifecycle.adopt_screen(chat_id, message_id, self._navigation_stack(chat_id).current, message=message)
+        message = callback_message
+        chat_id = callback_chat_id
+        message_id = callback_message_id
+        if stale_callback:
+            return
         if decoded:
             action, value = decoded
             admin_screens = {"status", "scan", "settings", "filters", "users", "errors"}
