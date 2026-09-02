@@ -23,6 +23,8 @@ from .storage import ObjectStore, StorageQuotaExceeded
 log = logging.getLogger(__name__)
 REMOVAL_CONFIRMATION_RUNS = 2
 ATTACHMENT_SUFFIXES = (".odt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".zip", ".rar", ".7z")
+ERROR_EVENT_KINDS = frozenset({"fetch_error", "storage_error"})
+ERROR_EVENT_DEDUP_WINDOW = timedelta(hours=24)
 
 
 def _scan_lock_path() -> Path:
@@ -158,6 +160,22 @@ class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
     async def close(self): await self.fetcher.close()
     def event(self,s,doc,kind,severity,summary,details=""):
+        if kind in ERROR_EVENT_KINDS:
+            cutoff = datetime.now(UTC) - ERROR_EVENT_DEDUP_WINDOW
+            duplicate = s.scalar(
+                select(Event.id)
+                .where(
+                    Event.document_id == (doc.id if doc else None),
+                    Event.kind == kind,
+                    Event.summary == summary,
+                    Event.details == details,
+                    Event.created_at >= cutoff,
+                )
+                .order_by(Event.id.desc())
+                .limit(1)
+            )
+            if duplicate is not None:
+                return
         s.add(Event(document_id=doc.id if doc else None,kind=kind,severity=severity,summary=summary,details=details,notified=False))
     async def discover(self) -> set[str]:
         queue=[canonicalize(settings.catalog_url)]; seen=set(); docs=set()
