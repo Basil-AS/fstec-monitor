@@ -134,13 +134,13 @@ class MessageLifecycleManager:
             if hasattr(self.transport, "edit_message_reply_markup"):
                 try:
                     await self.transport.edit_message_reply_markup(chat_id, message_id, {"inline_keyboard": []})
-                except (OSError, RuntimeError, TimeoutError) as exc:
+                except Exception as exc:  # noqa: BLE001 — cleanup must not mask the operation
                     log.debug("media markup cleanup skipped chat=%s message=%s: %s", chat_id, message_id, exc)
             return
         try:
             await self.transport.delete_message(chat_id, message_id)
-        except (OSError, RuntimeError, TimeoutError):
-            pass
+        except Exception as exc:  # noqa: BLE001 — cleanup must not mask the operation
+            log.debug("callback message cleanup skipped chat=%s message=%s: %s", chat_id, message_id, exc)
         session.context_message_ids.discard(message_id)
         if session.last_message_id == message_id:
             session.last_message_id = session.message_id
@@ -152,8 +152,8 @@ class MessageLifecycleManager:
             return
         try:
             await self.transport.delete_message(chat_id, message_id)
-        except (OSError, RuntimeError, TimeoutError):
-            pass
+        except Exception as exc:  # noqa: BLE001 — cleanup must not mask the operation
+            log.debug("old menu cleanup skipped chat=%s message=%s: %s", chat_id, message_id, exc)
         session.message_id = None
         session.payload = None
 
@@ -260,7 +260,7 @@ class MessageLifecycleManager:
         session = self.session(chat_id)
         try:
             await self.transport.delete_message(chat_id, message_id)
-        except (OSError, RuntimeError, TimeoutError):
+        except Exception:  # noqa: BLE001 — cleanup must not mask the operation
             log.debug("temporary message cleanup skipped chat=%s message=%s", chat_id, message_id)
         session.temporary_message_ids.discard(message_id)
         if session.last_message_id == message_id:
@@ -286,7 +286,7 @@ class MessageLifecycleManager:
                 return
             try:
                 await self.transport.delete_message(chat_id, message_id)
-            except (OSError, RuntimeError, TimeoutError) as exc:
+            except Exception as exc:  # noqa: BLE001 — cleanup must not mask the operation
                 log.debug("screen message cleanup failed chat=%s message=%s: %s", chat_id, message_id, exc)
             session.message_id = None
             session.payload = None

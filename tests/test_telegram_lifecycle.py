@@ -175,6 +175,24 @@ def test_stale_tail_creates_one_new_screen_instead_of_editing_history() -> None:
     asyncio.run(scenario())
 
 
+def test_cleanup_transport_errors_never_break_navigation() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        lifecycle = MessageLifecycleManager(transport)
+        await lifecycle.show_screen(7, "main", "main", None)
+
+        async def broken_delete(*_args):
+            raise ValueError("telegram cleanup failure")
+
+        transport.delete_message = broken_delete
+
+        await lifecycle.cleanup_old_menu(7)
+
+        assert lifecycle.session(7).message_id is None
+
+    asyncio.run(scenario())
+
+
 def test_stale_screen_message_is_not_current_chat_tail() -> None:
     async def scenario() -> None:
         transport = FakeTransport()
