@@ -356,7 +356,7 @@ class TelegramBot:
             self.scan_progress.finished_at = datetime.now(UTC)
             await self.refresh_scan_status()
             raise
-        except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+        except Exception as exc:
             self.scan_progress.state = "failed"
             self.scan_progress.stage = "Проверка завершилась с ошибкой"
             self.scan_progress.last_error = str(exc)[:500]
