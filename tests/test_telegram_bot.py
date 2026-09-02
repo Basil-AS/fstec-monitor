@@ -370,6 +370,28 @@ def test_legacy_admin_callback_adapter_handles_main_menu():
     assert replies == [("Главное меню готово. Выберите действие:", None, None)]
 
 
+def test_legacy_user_filter_callback_adapter_handles_toggle(monkeypatch):
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    replies = []
+    bot.toggle_user_ignored_category = lambda user_id, token: f"user={user_id}; token={token}"
+
+    class _AllowedSession(_FakeSettingsSession):
+        def get(self, _model, _key):
+            return SimpleNamespace(status="approved")
+
+    monkeypatch.setattr(telegram_bot_module, "SessionLocal", _AllowedSession)
+
+    async def reply(text, markup=None, fallback_chat_id=None):
+        replies.append((text, markup, fallback_chat_id))
+
+    handled = asyncio.run(bot._dispatch_legacy_user_callback(["userignore", "t", "cat"], 42, reply))
+
+    assert handled is True
+    assert replies == [("user=42; token=cat", None, 42)]
+
+
 def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     import asyncio
 
