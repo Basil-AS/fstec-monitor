@@ -76,6 +76,24 @@ def test_edit_and_delete_message_use_telegram_native_methods():
     ]
 
 
+def test_long_send_attaches_keyboard_only_to_tail_fragment():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return {"message_id": len(calls)}
+
+    bot.call = call
+    asyncio.run(bot.send(123, "x" * 8000, {"inline_keyboard": []}))
+
+    assert len(calls) == 3
+    assert all("reply_markup" not in payload for _, payload in calls[:-1])
+    assert calls[-1][1]["reply_markup"] == {"inline_keyboard": []}
+
+
 def test_callback_edits_origin_message_instead_of_sending_another():
     import asyncio
 
