@@ -419,13 +419,14 @@ def persist_scan_run(*, started, finished, documents: int, trigger: str, baselin
 
 async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=None,cancel_event=None):
     scan_lock = acquire_scan_lock()
-    m=Monitor()
+    m = None
     urls=[]; error=""; started=datetime.now(UTC); completed=0; errors_count=0
     def report(stage, done, total, errors):
         if progress_callback:
             progress_callback(stage, done, total, errors)
     log.info("scan started trigger=%s baseline=%s limit=%s", trigger, baseline, limit or "none")
     try:
+        m = Monitor()
         report("Обход каталога", 0, 0, 0)
         with SessionLocal() as s:
             ignored=ignored_category_keys()
@@ -482,7 +483,8 @@ async def run_monitor(baseline=False,limit=0,trigger="cli",progress_callback=Non
         error=repr(e)
         raise
     finally:
-        await m.close()
+        if m is not None:
+            await m.close()
         release_scan_lock(scan_lock)
         persist_scan_run(
             started=started,
