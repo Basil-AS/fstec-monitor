@@ -17,6 +17,7 @@ from .telegram_bot import api_url
 
 log = logging.getLogger(__name__)
 TELEGRAM_TEXT_LIMIT = 4096
+_TELEGRAM_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def _notification_lock_path() -> Path:
@@ -367,10 +368,17 @@ async def _deliver_to_recipients(
 
 
 async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict) -> None:
-    """Deliver one notification with the same bounded retry policy as fetches."""
+    """Deliver one notification without duplicating an unknown send outcome.
+
+    A transport timeout can happen after Telegram accepted ``sendMessage``.
+    Retrying that request would create duplicate notifications, so only an
+    explicit retryable HTTP response is retried.
+    """
     attempts = max(1, settings.max_retries)
     last_error: Exception | None = None
     for attempt in range(attempts):
+        response = None
+        retry = False
         try:
             response = await client.post(url, json=payload)
             response.raise_for_status()
@@ -378,10 +386,22 @@ async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict)
             if not body.get("ok"):
                 raise RuntimeError(body.get("description", "Telegram API rejected notification"))
             return
-        except (httpx.HTTPError, RuntimeError) as exc:
+        except httpx.HTTPStatusError as exc:
             last_error = exc
-            if attempt + 1 < attempts:
-                await asyncio.sleep(min(60, 2**attempt))
+            retry = exc.response is not None and exc.response.status_code in _TELEGRAM_RETRYABLE_STATUS_CODES
+        except (httpx.TimeoutException, httpx.TransportError, RuntimeError) as exc:
+            last_error = exc
+        finally:
+            close = getattr(response, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except (OSError, RuntimeError, httpx.HTTPError) as exc:
+                    log.debug("could not close notification response: %s", exc)
+        if retry and attempt + 1 < attempts:
+            await asyncio.sleep(min(60, 2**attempt))
+            continue
+        break
     assert last_error is not None
     raise last_error
 
