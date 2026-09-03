@@ -38,6 +38,7 @@ from .schedule import (
 from .storage import ObjectStore, StorageQuotaExceeded
 from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
+from .telegram.change_views import paginate_change_groups, visible_change_groups
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
 from .telegram.rendering import escape_html, has_html_markup, render_scan_progress
@@ -627,16 +628,32 @@ class TelegramBot:
                 "runs_count": len(durations),
             }
 
-    def changes_text(self, limit: int = 10, offset: int = 0) -> str:
-        with SessionLocal() as session:
-            events = session.scalars(
-                select(Event)
-                .where(Event.kind.in_(MEANINGFUL_KINDS))
-                .order_by(Event.id.desc())
-                .offset(max(0, offset))
-                .limit(max(1, min(limit, 30)))
-            ).all()
-            docs = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))).all()}
+    def changes_text(
+        self,
+        limit: int = 10,
+        offset: int = 0,
+        *,
+        _events: list[Event] | None = None,
+        _documents: dict[int, Document] | None = None,
+    ) -> str:
+        if _events is None:
+            with SessionLocal() as session:
+                events = session.scalars(
+                    select(Event)
+                    .where(Event.kind.in_(MEANINGFUL_KINDS))
+                    .order_by(Event.id.desc())
+                    .offset(max(0, offset))
+                    .limit(max(1, min(limit, 30)))
+                ).all()
+                docs = {
+                    d.id: d
+                    for d in session.scalars(
+                        select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))
+                    ).all()
+                }
+        else:
+            events = _events
+            docs = _documents or {}
         if not events:
             return "Изменений нет."
         lines = ["📰 Последние изменения"]
@@ -700,12 +717,20 @@ class TelegramBot:
             )
 
     def changes_page(self, page: int = 0, page_size: int = 5) -> tuple[str, list[list[dict]]]:
-        page_size = max(1, min(page_size, 10))
         with SessionLocal() as session:
-            total = session.scalar(select(func.count(Event.id)).where(Event.kind.in_(MEANINGFUL_KINDS))) or 0
-        pages = max(1, (total + page_size - 1) // page_size)
-        page = max(0, min(page, pages - 1))
-        text = self.changes_text(page_size, page * page_size)
+            events = session.scalars(
+                select(Event).where(Event.kind.in_(MEANINGFUL_KINDS)).order_by(Event.id.desc())
+            ).all()
+            docs = {
+                d.id: d
+                for d in session.scalars(
+                    select(Document).where(Document.id.in_([e.document_id for e in events if e.document_id]))
+                ).all()
+            }
+        groups = visible_change_groups(events, docs)
+        selected, page, pages = paginate_change_groups(groups, page, page_size)
+        selected_events = [event for _, _, group in selected for event in group]
+        text = self.changes_text(_events=selected_events, _documents=docs)
         if pages == 1:
             return text, []
         previous = page - 1 if page else pages - 1
