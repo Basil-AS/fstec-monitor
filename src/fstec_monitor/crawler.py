@@ -276,7 +276,7 @@ class Monitor:
                 session.flush()
                 # A new document already explains the attachment. Emitting
                 # one more event per format produced misleading floods.
-                if not baseline and not is_new:
+                if not baseline and not is_new and link.url in preferred_urls:
                     self.event(
                         session,
                         doc,
@@ -288,15 +288,19 @@ class Monitor:
             attachment.active = True
             attachment.last_seen_at = datetime.now(UTC)
             attachment.display_name = link.title
-            if link.url not in preferred_urls:
-                continue
             if audit_attachments or not session.scalar(
                 select(AttachmentVersion.id)
                 .where(AttachmentVersion.attachment_id == attachment.id)
                 .limit(1)
             ):
                 try:
-                    await self.process_attachment(session, doc, attachment, baseline)
+                    await self.process_attachment(
+                        session,
+                        doc,
+                        attachment,
+                        baseline,
+                        emit_changes=link.url in preferred_urls,
+                    )
                 except StorageQuotaExceeded as exc:
                     self.event(
                         session,
@@ -319,16 +323,20 @@ class Monitor:
             doc.last_attachment_audit_at = now
 
     async def _audit_cached_attachments(self, session, doc, now) -> None:
-        """Audit known preferred attachments when the page itself returns 304."""
+        """Audit all known variants when the page itself returns 304."""
         attachments = session.scalars(
             select(Attachment).where(Attachment.document_id == doc.id, Attachment.active.is_(True))
         ).all()
         preferred_urls = preferred_attachment_urls(attachments)
         for attachment in attachments:
-            if attachment.url not in preferred_urls:
-                continue
             try:
-                await self.process_attachment(session, doc, attachment, False)
+                await self.process_attachment(
+                    session,
+                    doc,
+                    attachment,
+                    False,
+                    emit_changes=attachment.url in preferred_urls,
+                )
             except StorageQuotaExceeded as exc:
                 self.event(
                     session, doc, "storage_error", "critical",
@@ -410,7 +418,7 @@ class Monitor:
             )
             if is_new and not baseline:self.event(s,doc,"document_added","warning",f"добавлен документ: {doc.title or url}",url)
             s.commit()
-    async def process_attachment(self,s,doc,att,baseline):
+    async def process_attachment(self, s, doc, att, baseline, *, emit_changes: bool = True):
         previous=s.scalar(select(AttachmentVersion).where(AttachmentVersion.attachment_id==att.id).order_by(AttachmentVersion.id.desc()))
         # The configured attachment timeout is an overall deadline for the
         # fetch, including retries.  Applying it only to each HTTP attempt
@@ -427,7 +435,10 @@ class Monitor:
             return
         r.raise_for_status(); data=r.content
         digest,key=self.store.put(data,PathSuffix(att.url,r.headers.get("content-type","")))
-        if previous and previous.binary_sha256==digest:return
+        if previous and previous.binary_sha256==digest:
+            previous.etag = r.headers.get("etag", "") or previous.etag
+            previous.last_modified = r.headers.get("last-modified", "") or previous.last_modified
+            return
         text = await asyncio.to_thread(
             semantic_text,
             data,
@@ -437,7 +448,7 @@ class Monitor:
         sem=sha(text) if text else ""
         _,text_key=self.store.put(text.encode(),".txt") if text else ("","")
         s.add(AttachmentVersion(attachment_id=att.id,status_code=r.status_code,content_type=r.headers.get("content-type",""),content_length=len(data),binary_sha256=digest,semantic_sha256=sem,object_key=key,extracted_text_key=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
-        if previous and not baseline:
+        if previous and not baseline and emit_changes:
             same=bool(sem and sem==previous.semantic_sha256)
             self.event(s,doc,"attachment_binary_changed" if same else "attachment_content_changed","info" if same else "critical",f"обновлено вложение: {att.display_name}",f"{att.url}\nold={previous.binary_sha256}\nnew={digest}\nsemantic_same={same}")
 

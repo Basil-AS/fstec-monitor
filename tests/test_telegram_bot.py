@@ -397,6 +397,32 @@ def test_admin_menu_exposes_settings_and_manual_scan():
     assert all(not label.startswith("/") for label in labels)
 
 
+def test_start_command_renders_reusable_screen_instead_of_new_message():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    rendered = []
+
+    async def render(chat_id, screen, **kwargs):
+        rendered.append((chat_id, screen, kwargs))
+
+    async def send(*_args, **_kwargs):
+        raise AssertionError("navigation commands must reuse the lifecycle screen")
+
+    bot._render_screen = render
+    bot.send = send
+
+    asyncio.run(bot.handle({
+        "message": {
+            "from": {"id": 151599744},
+            "chat": {"id": 151599744},
+            "text": "/start",
+        }
+    }))
+
+    assert rendered == [(151599744, "main", {"reset": True})]
+
+
 def test_user_menu_contains_only_read_only_actions():
     labels = [button["text"] for row in user_keyboard()["keyboard"] for button in row]
 

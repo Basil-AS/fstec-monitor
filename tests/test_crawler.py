@@ -140,6 +140,75 @@ def test_preferred_attachment_source_falls_back_to_pdf():
     assert preferred_attachment_urls([link]) == {link.url}
 
 
+def test_discover_fetches_each_catalog_page_once(monkeypatch):
+    monkeypatch.setattr(crawler.settings, "catalog_url", "https://fstec.ru/dokumenty/vse-dokumenty")
+    calls = []
+
+    class Response:
+        status_code = 200
+        url = "https://fstec.ru/dokumenty/vse-dokumenty"
+        text = (
+            "<html><body><main><h1>Каталог</h1>"
+            "<a href='/dokumenty/vse-dokumenty/prikazy/doc-1'>Doc</a>"
+            "</main></body></html>"
+        )
+
+        def raise_for_status(self):
+            return None
+
+    class Fetcher:
+        async def get(self, url):
+            calls.append(url)
+            return Response()
+
+    async def run():
+        monitor = Monitor.__new__(Monitor)
+        monitor.fetcher = Fetcher()
+        return await monitor.discover()
+
+    assert asyncio.run(run()) == {"https://fstec.ru/dokumenty/vse-dokumenty/prikazy/doc-1"}
+    assert calls == ["https://fstec.ru/dokumenty/vse-dokumenty"]
+
+
+def test_sync_archives_both_attachment_variants_but_compares_preferred_only(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path}/attachment-variants.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+
+    async def run():
+        monitor = Monitor.__new__(Monitor)
+        calls = []
+
+        async def process_attachment(_session, _document, attachment, _baseline, *, emit_changes=True):
+            calls.append((attachment.url, emit_changes))
+
+        monitor.process_attachment = process_attachment
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/doc", title="Doc")
+            session.add(document)
+            session.flush()
+            links = [
+                SimpleNamespace(url="https://example.test/doc.pdf", title="Report"),
+                SimpleNamespace(url="https://example.test/doc.odt", title="Report"),
+            ]
+            await monitor._sync_attachments(
+                session, document, links, None, "text-hash", False, False, True, datetime.now(UTC)
+            )
+            session.commit()
+            return calls, session.scalars(select(Attachment)).all()
+
+    calls, attachments = asyncio.run(run())
+    assert calls == [
+        ("https://example.test/doc.pdf", False),
+        ("https://example.test/doc.odt", True),
+    ]
+    assert {attachment.url for attachment in attachments} == {
+        "https://example.test/doc.pdf",
+        "https://example.test/doc.odt",
+    }
+
+
 def test_attachment_extraction_runs_off_event_loop(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/extract.db")
     Base.metadata.create_all(engine)
@@ -265,10 +334,10 @@ def test_attachment_audit_is_repeated_to_catch_file_updates(monkeypatch, tmp_pat
         calls = 0
         original_process_attachment = monitor.process_attachment
 
-        async def tracked_process_attachment(_session, _document, _attachment, _baseline):
+        async def tracked_process_attachment(_session, _document, _attachment, _baseline, **kwargs):
             nonlocal calls
             calls += 1
-            return await original_process_attachment(_session, _document, _attachment, _baseline)
+            return await original_process_attachment(_session, _document, _attachment, _baseline, **kwargs)
 
         monitor.process_attachment = tracked_process_attachment
         url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
@@ -327,7 +396,7 @@ def test_attachment_audit_runs_when_document_page_is_not_modified(monkeypatch, t
         calls = 0
         cached_audits = 0
 
-        async def tracked_process_attachment(_session, _document, _attachment, _baseline):
+        async def tracked_process_attachment(_session, _document, _attachment, _baseline, **_kwargs):
             nonlocal calls
             calls += 1
 
