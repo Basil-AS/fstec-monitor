@@ -855,7 +855,7 @@ class TelegramBot:
         self.set_ignored_categories_db(ignored + [target])
         return f"🚫 Категория добавлена в игнор: {target}"
 
-    def ignore_text(self) -> tuple[str, dict | None]:
+    def ignore_text(self, page: int = 0) -> tuple[str, dict | None]:
         env_ignored = sorted(settings.ignored_category_set)
         db_ignored = self.ignored_categories_db()
         db_keys = {category_key(c) for c in db_ignored}
@@ -870,16 +870,47 @@ class TelegramBot:
             lines.append("пока нет")
         with SessionLocal() as session:
             known = sorted(c for c in session.scalars(select(Document.category).distinct()).all() if c)
+        page_categories, page, pages = paginate_lines(known, page, 8)
         buttons = []
-        for category in known[:20]:
+        for category in page_categories:
             ignored = category_key(category) in db_keys or category_key(category) in set(env_ignored)
             mark = "🚫" if ignored else "👁"
             buttons.append([{"text": f"{mark} {category[:40]}", "callback_data": telegram_keyboards.encode_callback("ignore", category_token(category))}])
         if not buttons:
             return "\n".join(lines), None
         lines.append("")
+        if pages > 1:
+            lines.append(f"страница {page + 1}/{pages}")
+            buttons.append(pagination_row(
+                page, pages,
+                lambda target: telegram_keyboards.encode_callback("screen", f"filters-page-{target}"),
+            ))
         lines.append("Нажмите на категорию, чтобы переключить игнор (🚫 — игнорируется):")
         return "\n".join(lines), {"inline_keyboard": buttons}
+
+    def errors_page(self, page: int = 0, page_size: int = 5) -> tuple[str, list[list[dict]]]:
+        with SessionLocal() as session:
+            errors = session.scalars(
+                select(Event).where(Event.kind.in_(ERROR_KINDS)).order_by(Event.id.desc())
+            ).all()
+        selected, page, pages = paginate_lines(errors, page, page_size)
+        if not errors:
+            return "Ошибок нет.", []
+        text = "\n".join(
+            [f"⚠️ Ошибки · страница {page + 1}/{pages}"]
+            + [
+                f"#{event.id} {_dt(event.created_at)} {escape_html(event.summary or '')}: "
+                f"{escape_html((event.details or '')[:300])}"
+                for event in selected
+            ]
+        )
+        rows: list[list[dict]] = []
+        if pages > 1:
+            rows.append(pagination_row(
+                page, pages,
+                lambda target: telegram_keyboards.encode_callback("screen", f"errors-page-{target}"),
+            ))
+        return text, rows
 
     def clear_errors_text(self) -> tuple[str, dict | None]:
         with SessionLocal() as session:
@@ -1004,7 +1035,8 @@ class TelegramBot:
             text = await asyncio.to_thread(self.settings_text)
             view = screen_with_navigation(screen, text, settings_keyboard(self.notifications_enabled()).get("inline_keyboard", []))
         elif screen == "filters":
-            text, markup = await asyncio.to_thread(self.ignore_text)
+            page = payload.get("page", 0) if isinstance(payload, dict) else 0
+            text, markup = await asyncio.to_thread(self.ignore_text, page)
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []) if markup else [])
         elif screen == "my_ignore":
             page = payload.get("page", 0) if isinstance(payload, dict) else 0
@@ -1015,10 +1047,9 @@ class TelegramBot:
             text, markup = await asyncio.to_thread(self.users_text, page)
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []) if markup else [])
         elif screen == "errors":
-            with SessionLocal() as session:
-                errors = session.scalars(select(Event).where(Event.kind.in_(ERROR_KINDS)).order_by(Event.id.desc()).limit(10)).all()
-            text = "\\n".join(f"#{event.id} {_dt(event.created_at)} {event.summary}: {event.details[:300]}" for event in errors) or "Ошибок нет."
-            view = screen_with_navigation(screen, text, [])
+            page = payload.get("page", 0) if isinstance(payload, dict) else 0
+            text, rows = await asyncio.to_thread(self.errors_page, page)
+            view = screen_with_navigation(screen, text, rows)
         elif screen == "help":
             if is_admin_user:
                 text = (
@@ -1151,12 +1182,17 @@ class TelegramBot:
                     stack.replace("changes", {"page": int(page)})
                     await self._render_screen(chat_id or sender_id, "changes", source_message=message, payload={"page": int(page)})
                 return True
-            if value.startswith(("users-page-", "my-ignore-page-")):
+            if value.startswith(("users-page-", "my-ignore-page-", "filters-page-", "errors-page-")):
                 prefix, raw_page = value.rsplit("-", 1)
                 target = chat_id or sender_id
                 if target is not None and raw_page.isdigit():
                     page = int(raw_page)
-                    screen = "users" if prefix == "users-page" else "my_ignore"
+                    screen = {
+                        "users-page": "users",
+                        "my-ignore-page": "my_ignore",
+                        "filters-page": "filters",
+                        "errors-page": "errors",
+                    }[prefix]
                     stack = self._navigation_stack(target)
                     stack.replace(screen, {"page": page})
                     await self._render_screen(
