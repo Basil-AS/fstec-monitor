@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from fstec_monitor.http import Fetcher, request_timeout
+from fstec_monitor.http import Fetcher, request_headers, request_timeout
 
 
 def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
@@ -51,6 +51,16 @@ def test_fetcher_uses_longer_timeout_for_binary_attachments(monkeypatch):
     assert calls[0][1]["timeout"] == 120.0
     assert calls[1][1]["timeout"] == 180.0
     assert request_timeout("https://example.test/file.PDF") == 120.0
+
+
+def test_binary_requests_disable_content_encoding_but_keep_conditional_headers():
+    assert request_headers("https://example.test/file.odt", {"If-None-Match": '"abc"'}) == {
+        "If-None-Match": '"abc"',
+        "Accept-Encoding": "identity",
+    }
+    assert request_headers("https://example.test/page", {"If-None-Match": '"abc"'}) == {
+        "If-None-Match": '"abc"',
+    }
 
 
 def test_fetcher_jitter_is_bounded_by_configured_delay(monkeypatch):
