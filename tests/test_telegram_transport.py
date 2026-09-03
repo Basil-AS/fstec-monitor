@@ -31,7 +31,7 @@ def test_send_uses_html_only_for_explicit_markup_and_logs_metadata(monkeypatch, 
     assert message_id == 41
     assert calls[0][0] == "sendMessage"
     assert calls[0][1]["parse_mode"] == "HTML"
-    assert "TGUX chat=7 method=sendMessage message_id=- screen=main reason=navigation" in caplog.text
+    assert "TGUX chat=7 method=sendMessage message_id=41 screen=main reason=navigation" in caplog.text
     assert "token" not in caplog.text.casefold()
 
 
@@ -58,6 +58,36 @@ def test_chat_action_and_callback_toast_are_recorded_as_metadata(monkeypatch, ca
         ("answerCallbackQuery", {"callback_query_id": "callback-1", "text": "Сохранено"}),
     ]
     assert "TGUX chat=7 method=answerCallbackQuery message_id=- screen=- reason=callback-toast" in caplog.text
+
+
+def test_persistent_document_telemetry_records_returned_message_id(monkeypatch, caplog) -> None:
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.token = "token"
+
+    async def call(method, payload):
+        assert method == "sendChatAction"
+        return True
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 99}}
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    bot.call = call
+    bot.client = Client()
+    monkeypatch.setenv("FSTEC_TGUX_LOGGING", "1")
+
+    with caplog.at_level("INFO"):
+        message_id = asyncio.run(bot.send_file(7, "report.md", b"# report"))
+
+    assert message_id == 99
+    assert "TGUX chat=7 method=sendDocument message_id=99 screen=- reason=persistent-report" in caplog.text
 
 
 def test_markup_cleanup_has_a_dedicated_bot_api_method() -> None:

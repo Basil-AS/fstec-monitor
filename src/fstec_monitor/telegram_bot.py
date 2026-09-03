@@ -260,10 +260,15 @@ class TelegramBot:
             # only on its tail fragment so navigation never gets duplicated.
             if reply_markup is not None and start + 3900 >= len(text):
                 payload["reply_markup"] = reply_markup
-            self._log_tgux("sendMessage", payload, screen=screen, reason=reason)
             result = await self.call("sendMessage", payload)
             if isinstance(result, dict):
                 message_id = result.get("message_id", message_id)
+            self._log_tgux(
+                "sendMessage",
+                {**payload, "message_id": message_id} if message_id is not None else payload,
+                screen=screen,
+                reason=reason,
+            )
         return message_id
 
     async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None, *, screen: str | None = None, reason: str = "navigation") -> None:
@@ -342,7 +347,6 @@ class TelegramBot:
             log.warning("could not set Telegram chat menu button: %s", exc)
 
     async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> int | None:
-        self._log_tgux("sendDocument", {"chat_id": chat_id}, reason="persistent-report")
         await self.send_chat_action(chat_id, "upload_document")
         response = await self.client.post(
             api_url(settings.telegram_api_root, self.token, "sendDocument"),
@@ -355,6 +359,10 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
         result = body.get("result") or {}
         message_id = result.get("message_id") if isinstance(result, dict) else None
+        payload = {"chat_id": chat_id}
+        if message_id is not None:
+            payload["message_id"] = message_id
+        self._log_tgux("sendDocument", payload, reason="persistent-report")
         if message_id and getattr(self, "lifecycle", None) is not None:
             self.lifecycle.remember_message(chat_id, message_id, persistent=True)
         return message_id
