@@ -1279,10 +1279,18 @@ class TelegramBot:
         return False
 
     def _callback_access_allowed(self, action: str, value: str, sender_id: int | None) -> bool:
-        """Check the cheap role boundary before dispatching callback work."""
-        admin_screens = {"status", "scan", "settings", "filters", "users", "errors"}
-        admin_user = is_admin(sender_id, settings.telegram_admin_id)
-        return admin_user or not ((action == "screen" and value in admin_screens) or action == "settings")
+        """Check the role boundary before dispatching any callback work.
+
+        Callbacks are untrusted input: a regular user can replay an old button
+        or manufacture callback data even when the current keyboard hides it.
+        Keep the user surface allowlisted rather than trying to enumerate only
+        the currently known admin actions.
+        """
+        if is_admin(sender_id, settings.telegram_admin_id):
+            return True
+        if action in {"menu", "nav", "userignore"}:
+            return True
+        return action == "screen" and value in {"changes", "my_ignore", "help"}
 
     def _callback_user_is_allowed(self, sender_id: int | None) -> bool:
         if not sender_id:

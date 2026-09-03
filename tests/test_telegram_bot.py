@@ -45,6 +45,20 @@ def test_callback_access_boundary_rejects_admin_screens_for_non_admin():
     assert bot._callback_access_allowed("screen", "changes", 42) is True
 
 
+@pytest.mark.parametrize("action", ["scan", "ignore", "users", "errors", "settings", "access"])
+def test_non_admin_callback_actions_are_denied_by_default(action):
+    bot = TelegramBot.__new__(TelegramBot)
+
+    assert bot._callback_access_allowed(action, "run", 42) is False
+
+
+@pytest.mark.parametrize("action", ["menu", "nav", "userignore"])
+def test_non_admin_callback_navigation_and_personal_filters_remain_allowed(action):
+    bot = TelegramBot.__new__(TelegramBot)
+
+    assert bot._callback_access_allowed(action, "value", 42) is True
+
+
 def test_update_envelope_routing_keeps_callback_and_message_paths_separate():
     import asyncio
 
