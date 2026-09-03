@@ -233,34 +233,8 @@ def split_new_errors(events: list[Event], previously_notified: list[Event]) -> t
     return unique, duplicates
 
 
-async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict) -> None:
-    """Deliver one notification with the same bounded retry policy as fetches."""
-    attempts = max(1, settings.max_retries)
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok"):
-                raise RuntimeError(body.get("description", "Telegram API rejected notification"))
-            return
-        except (httpx.HTTPError, RuntimeError) as exc:
-            last_error = exc
-            if attempt + 1 < attempts:
-                await asyncio.sleep(min(60, 2**attempt))
-    assert last_error is not None
-    raise last_error
-
-@_single_flight
-async def notify_pending(session) -> int:
-    if not settings.telegram_bot_token:
-        return 0
-    setting = session.get(BotSetting, "notifications_enabled")
-    if setting and setting.value == "0":
-        return 0
-
-    events = session.scalars(select(Event).where(Event.notified.is_(False)).order_by(Event.id)).all()
+def _notification_recipients(session) -> set[int]:
+    """Resolve configured and approved recipients once per delivery pass."""
     recipients = {settings.telegram_admin_id}
     if settings.telegram_chat_id:
         try:
@@ -272,9 +246,11 @@ async def notify_pending(session) -> int:
         for user in session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
     )
     recipients.discard(None)
-    if not recipients:
-        return 0
+    return recipients
 
+
+def _pending_event_batches(session, events: list[Event]) -> tuple[list[Event], list[Event]]:
+    """Filter, deduplicate, and persist event bookkeeping before delivery."""
     error_events = [event for event in events if event.kind in ERROR_KINDS]
     notified_errors = session.scalars(
         select(Event).where(Event.kind.in_(ERROR_KINDS), Event.notified.is_(True))
@@ -288,6 +264,7 @@ async def notify_pending(session) -> int:
     for event in other_events:
         if not should_notify_event(event):
             event.notified = True
+
     seen: set[tuple[str, int | None, str, str]] = set()
     unique_events: list[Event] = []
     for event in meaningful_events:
@@ -298,14 +275,16 @@ async def notify_pending(session) -> int:
         seen.add(fingerprint)
         unique_events.append(event)
     session.commit()
+    return error_events, unique_events
 
-    candidate_events = error_events + unique_events
-    if not candidate_events:
-        return 0
+
+def _notification_context(session, candidate_events: list[Event]):
     documents = {
         document.id: document
         for document in session.scalars(
-            select(Document).where(Document.id.in_({event.document_id for event in candidate_events if event.document_id}))
+            select(Document).where(
+                Document.id.in_({event.document_id for event in candidate_events if event.document_id})
+            )
         ).all()
     }
     approved_users = session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
@@ -317,6 +296,19 @@ async def notify_pending(session) -> int:
         ).all()
         for row in ignored_rows:
             ignored_by_user.setdefault(row.user_id, set()).add(row.category_key)
+    return documents, user_by_chat, ignored_by_user
+
+
+async def _deliver_to_recipients(
+    session,
+    recipients: set[int],
+    candidate_events: list[Event],
+    error_events: list[Event],
+    unique_events: list[Event],
+    documents: dict[int, Document],
+    user_by_chat: dict[int, int],
+    ignored_by_user: dict[int, set[str]],
+) -> int:
     sent = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
         for chat_id in sorted(recipients):
@@ -324,9 +316,11 @@ async def notify_pending(session) -> int:
                 select(EventDelivery.event_id).where(EventDelivery.chat_id == chat_id)
             ).all())
             ignored = ignored_by_user.get(user_by_chat.get(chat_id), set())
+
             def visible(event: Event, ignored: set[str] = ignored) -> bool:
                 document = documents.get(event.document_id) if event.document_id else None
                 return not ignored or not document or category_key(document.category) not in ignored
+
             hidden_events = [event for event in candidate_events if event.id not in delivered and not visible(event)]
             for event in hidden_events:
                 session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
@@ -363,6 +357,51 @@ async def notify_pending(session) -> int:
                     for event in message_events:
                         session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
                     session.commit()
+    return sent
+
+
+async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict) -> None:
+    """Deliver one notification with the same bounded retry policy as fetches."""
+    attempts = max(1, settings.max_retries)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("ok"):
+                raise RuntimeError(body.get("description", "Telegram API rejected notification"))
+            return
+        except (httpx.HTTPError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(60, 2**attempt))
+    assert last_error is not None
+    raise last_error
+
+@_single_flight
+async def notify_pending(session) -> int:
+    if not settings.telegram_bot_token:
+        return 0
+    setting = session.get(BotSetting, "notifications_enabled")
+    if setting and setting.value == "0":
+        return 0
+
+    events = session.scalars(select(Event).where(Event.notified.is_(False)).order_by(Event.id)).all()
+    recipients = _notification_recipients(session)
+    if not recipients:
+        return 0
+
+    error_events, unique_events = _pending_event_batches(session, events)
+
+    candidate_events = error_events + unique_events
+    if not candidate_events:
+        return 0
+    documents, user_by_chat, ignored_by_user = _notification_context(session, candidate_events)
+    sent = await _deliver_to_recipients(
+        session, recipients, candidate_events, error_events, unique_events,
+        documents, user_by_chat, ignored_by_user,
+    )
 
     for event in candidate_events:
         if all(
