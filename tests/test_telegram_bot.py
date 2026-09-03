@@ -1116,6 +1116,54 @@ def test_paginate_lines_keeps_page_bounds_and_reports_page_count():
     assert total == 1
 
 
+def test_global_categories_are_paginated(tmp_db):
+    with tmp_db() as session:
+        session.add_all(
+            [
+                Document(canonical_url=f"https://example.test/{index}", category=f"Category {index}")
+                for index in range(21)
+            ]
+        )
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    text, markup = bot.ignore_text()
+
+    assert len(markup["inline_keyboard"]) == 9  # eight categories + pager
+    assert "страница 1/3" in text
+    assert markup["inline_keyboard"][-1][2]["callback_data"] == "v1:screen:filters-page-1"
+
+
+def test_error_screen_is_paginated(tmp_db):
+    with tmp_db() as session:
+        session.add_all(
+            [
+                Event(kind="fetch_error", severity="error", summary=f"error {index}", details="details")
+                for index in range(11)
+            ]
+        )
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    text, markup = bot.errors_page()
+
+    assert "страница 1/3" in text
+    assert len(markup) == 1
+    assert markup[0][2]["callback_data"] == "v1:screen:errors-page-1"
+
+
+def test_error_screen_escapes_source_content(tmp_db):
+    with tmp_db() as session:
+        session.add(Event(kind="fetch_error", severity="error", summary="<b>bad</b>", details="<script>x</script>"))
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    text, _ = bot.errors_page()
+
+    assert "&lt;b&gt;bad&lt;/b&gt;" in text
+    assert "&lt;script&gt;x&lt;/script&gt;" in text
+
+
 def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):
     store = ObjectStore(root=tmp_path / "objects", quota_root=tmp_path, quota_bytes=10**9)
     _, old_key = store.put(b"old line\n", ".txt")
