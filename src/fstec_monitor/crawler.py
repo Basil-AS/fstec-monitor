@@ -109,6 +109,27 @@ def snapshot_required(previous_semantic: str, current_semantic: str, has_previou
     return not has_previous or previous_semantic != current_semantic
 
 
+def classify_page_change(
+    *,
+    previous_semantic: str,
+    current_semantic: str,
+    previous_html: str,
+    current_html: str,
+    has_previous: bool,
+) -> tuple[bool, bool]:
+    """Classify a fetched page without touching storage or database state.
+
+    The semantic change takes precedence over markup-only change. Keeping this
+    decision pure makes the event policy explicit and prevents a page whose
+    text and markup both changed from producing two competing classifications.
+    """
+    semantic_changed = snapshot_required(previous_semantic, current_semantic, has_previous)
+    markup_changed = bool(
+        has_previous and previous_html and previous_html != current_html
+    )
+    return semantic_changed, markup_changed and not semantic_changed
+
+
 def reconcile_document_presence(session, seen_urls: set[str], baseline: bool = False) -> None:
     """Reconcile a completed catalog discovery with stored document state.
 
@@ -159,6 +180,27 @@ async def gather_workers(workers):
 class Monitor:
     def __init__(self): self.store=ObjectStore(); self.fetcher=Fetcher()
     async def close(self): await self.fetcher.close()
+
+    def _archive_page_snapshot(self, session, document, response, raw, normalized_html, text):
+        """Persist one complete page representation and return its hashes."""
+        raw_hash, raw_key = self.store.put(raw, ".html")
+        html_hash, html_key = self.store.put(normalized_html.encode(), ".normalized.html")
+        text_hash, text_key = self.store.put(text.encode(), ".txt")
+        session.add(Snapshot(
+            document_id=document.id,
+            status_code=response.status_code,
+            final_url=str(response.url),
+            raw_sha256=raw_hash,
+            semantic_sha256=text_hash,
+            html_sha256=html_hash,
+            raw_object=raw_key,
+            normalized_html_object=html_key,
+            normalized_text_object=text_key,
+            etag=response.headers.get("etag", ""),
+            last_modified=response.headers.get("last-modified", ""),
+        ))
+        return raw_hash, html_hash, text_hash
+
     def event(self,s,doc,kind,severity,summary,details=""):
         if kind in ERROR_EVENT_KINDS:
             cutoff = datetime.now(UTC) - ERROR_EVENT_DEDUP_WINDOW
@@ -327,41 +369,32 @@ class Monitor:
             is_new=doc is None
             if is_new: doc=Document(canonical_url=url,title=parsed.title,category=parsed.category); s.add(doc); s.flush()
             previous=s.scalar(select(Snapshot).where(Snapshot.document_id==doc.id).order_by(Snapshot.id.desc()))
-            raw_hash=sha(raw); html_hash=sha(normalized_html); text_hash=sha(text)
+            html_hash=sha(normalized_html); text_hash=sha(text)
             previous_semantic=doc.current_semantic_sha256 or (previous.semantic_sha256 if previous else "")
             previous_html=doc.current_html_sha256 or (previous.html_sha256 if previous else "")
-            semantic_changed=snapshot_required(previous_semantic,text_hash,previous is not None)
-            markup_changed=bool(previous and previous_html and previous_html!=html_hash)
+            semantic_changed, markup_changed = classify_page_change(
+                previous_semantic=previous_semantic,
+                current_semantic=text_hash,
+                previous_html=previous_html,
+                current_html=html_hash,
+                has_previous=previous is not None,
+            )
             if semantic_changed:
-                raw_hash,raw_key=self.store.put(raw,".html")
-                html_hash,html_key=self.store.put(normalized_html.encode(),".normalized.html")
-                text_hash,text_key=self.store.put(text.encode(),".txt")
-                s.add(Snapshot(document_id=doc.id,status_code=r.status_code,final_url=str(r.url),raw_sha256=raw_hash,semantic_sha256=text_hash,html_sha256=html_hash,raw_object=raw_key,normalized_html_object=html_key,normalized_text_object=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
                 if previous and not baseline:
                     old=self.store.read(previous.normalized_text_object).decode(errors="replace")
                     diff="\n".join(difflib.unified_diff(old.splitlines(),text.splitlines(),fromfile="old",tofile="new",n=3))[:12000]
                     self.event(s,doc,"html_content_changed","critical",f"изменена страница: {doc.title or url}",diff)
+                _, html_hash, text_hash = self._archive_page_snapshot(
+                    s, doc, r, raw, normalized_html, text
+                )
             elif markup_changed:
-                raw_hash, raw_key = self.store.put(raw, ".html")
-                html_hash, html_key = self.store.put(normalized_html.encode(), ".normalized.html")
-                text_hash, text_key = self.store.put(text.encode(), ".txt")
-                s.add(Snapshot(
-                    document_id=doc.id,
-                    status_code=r.status_code,
-                    final_url=str(r.url),
-                    raw_sha256=raw_hash,
-                    semantic_sha256=text_hash,
-                    html_sha256=html_hash,
-                    raw_object=raw_key,
-                    normalized_html_object=html_key,
-                    normalized_text_object=text_key,
-                    etag=r.headers.get("etag", ""),
-                    last_modified=r.headers.get("last-modified", ""),
-                ))
                 if not baseline:
                     old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
                     diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
                     self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
+                _, html_hash, text_hash = self._archive_page_snapshot(
+                    s, doc, r, raw, normalized_html, text
+                )
             doc.current_html_sha256=html_hash; doc.current_semantic_sha256=text_hash; doc.current_etag=r.headers.get("etag", ""); doc.current_last_modified=r.headers.get("last-modified", "")
             doc.title=parsed.title or doc.title; doc.category=parsed.category or doc.category; doc.last_seen_at=datetime.now(UTC); doc.active=True; doc.missing_runs=0
             await self._sync_attachments(
