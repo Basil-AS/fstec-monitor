@@ -414,6 +414,51 @@ def test_non_admin_command_whitelist_excludes_operations():
     assert not is_user_command_allowed("/settings")
 
 
+def test_stale_callback_cleans_old_navigation_message_without_dispatching():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.scan_task = None
+    cleaned = []
+    answered = []
+
+    class Session:
+        message_id = 99
+
+    class Lifecycle:
+        def session(self, _chat_id):
+            return Session()
+
+        @staticmethod
+        def is_media_message(_message):
+            return False
+
+        @staticmethod
+        def is_current_screen_message(_chat_id, _message_id):
+            return False
+
+        async def cleanup_trigger_message(self, chat_id, message):
+            cleaned.append((chat_id, message["message_id"]))
+
+    bot.lifecycle = Lifecycle()
+
+    async def answer(callback_id, text, **_kwargs):
+        answered.append((callback_id, text))
+
+    bot.answer_callback = answer
+    callback = {
+        "id": "stale-1",
+        "from": {"id": 151599744},
+        "data": "v1:nav:back",
+        "message": {"message_id": 10, "chat": {"id": 123}},
+    }
+
+    asyncio.run(bot.handle_callback(callback))
+
+    assert answered == [("stale-1", "Экран устарел")]
+    assert cleaned == [(123, 10)]
+
+
 def test_non_admin_restricted_command_uses_temporary_feedback(monkeypatch):
     import asyncio
 

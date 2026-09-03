@@ -1480,6 +1480,12 @@ class TelegramBot:
         chat_id = callback_chat_id
         message_id = callback_message_id
         if stale_callback:
+            lifecycle = getattr(self, "lifecycle", None)
+            if lifecycle is not None and chat_id:
+                try:
+                    await lifecycle.cleanup_trigger_message(chat_id, message)
+                except Exception as exc:  # noqa: BLE001 — stale cleanup is best-effort
+                    log.debug("stale callback cleanup skipped chat=%s: %s", chat_id, exc)
             return
         if decoded:
             action, value = decoded
