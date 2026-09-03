@@ -38,6 +38,30 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_update_envelope_routing_keeps_callback_and_message_paths_separate():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    routed = []
+
+    async def callback_path(value):
+        routed.append(("callback", value))
+
+    async def message_path(value):
+        routed.append(("message", value))
+
+    bot._handle_callback_update = callback_path
+    bot._handle_message_update = message_path
+
+    asyncio.run(bot.handle({"callback_query": {"id": "c1"}}))
+    asyncio.run(bot.handle({"message": {"message_id": 7}}))
+
+    assert routed == [
+        ("callback", {"id": "c1"}),
+        ("message", {"message_id": 7}),
+    ]
+
+
 def test_back_callback_renders_previous_payload_context():
     import asyncio
 
