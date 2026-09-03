@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from fstec_monitor.telegram.lifecycle import MessageLifecycleManager
+from fstec_monitor.telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from fstec_monitor.telegram.ux.callbacks import CallbackCodec
 from fstec_monitor.telegram.ux.errors import TelegramErrorKind, classify_telegram_error
 from fstec_monitor.telegram.ux.keyboards import navigation_row, pagination_row, with_navigation
@@ -170,3 +170,21 @@ def test_notification_settlement_updates_all_copies_once() -> None:
 
 def test_telegram_error_classifier_treats_not_modified_as_noop() -> None:
     assert classify_telegram_error(RuntimeError("Bad Request: message is not modified")) is TelegramErrorKind.NOT_MODIFIED
+
+
+def test_progress_close_does_not_wait_for_throttle_interval() -> None:
+    async def scenario() -> None:
+        rendered: list[str] = []
+
+        async def render(value: str) -> None:
+            rendered.append(value)
+
+        coalescer = ProgressCoalescer(render, interval=2.0)
+        coalescer.submit("first")
+        await asyncio.sleep(0)
+        coalescer.submit("latest")
+        await asyncio.sleep(0)
+        await asyncio.wait_for(coalescer.close(), timeout=0.1)
+        assert rendered == ["first", "latest"]
+
+    asyncio.run(scenario())

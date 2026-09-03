@@ -386,6 +386,11 @@ class ProgressCoalescer:
     async def close(self) -> None:
         self._closed = True
         if self._task is not None:
+            # Do not make completion wait for the throttle sleep.  The latest
+            # value is rendered below, so cancelling the pending worker cannot
+            # lose the final progress state.
+            if not self._task.done():
+                self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         if self._latest is not None:
             value, self._latest = self._latest, None
