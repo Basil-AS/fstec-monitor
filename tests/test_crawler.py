@@ -12,6 +12,7 @@ from fstec_monitor.crawler import (
     Monitor,
     acquire_scan_lock,
     category_key,
+    classify_page_change,
     preferred_attachment_urls,
     release_scan_lock,
     scan_concurrency,
@@ -104,6 +105,26 @@ def test_markup_only_change_does_not_require_semantic_change():
     assert not snapshot_required("same", "same", True)
     assert snapshot_required("old", "new", True)
     assert snapshot_required("", "new", False)
+
+
+def test_page_change_classification_prefers_semantic_change():
+    assert classify_page_change(
+        previous_semantic="old",
+        current_semantic="new",
+        previous_html="old-html",
+        current_html="new-html",
+        has_previous=True,
+    ) == (True, False)
+
+
+def test_page_change_classification_detects_markup_only_change():
+    assert classify_page_change(
+        previous_semantic="same",
+        current_semantic="same",
+        previous_html="old-html",
+        current_html="new-html",
+        has_previous=True,
+    ) == (False, True)
 
 
 def test_preferred_attachment_source_chooses_odt_over_pdf():
