@@ -464,6 +464,9 @@ class TelegramBot:
     def start_scan(self, trigger: str = "manual") -> bool:
         if self.scan_is_running():
             return False
+        coalescer = getattr(self, "progress_coalescer", None)
+        if coalescer is not None:
+            coalescer.reset()
         self.scan_cancel_event = asyncio.Event()
         self.scan_progress = ScanProgress(state="running", stage="Подготовка проверки", started_at=datetime.now(UTC))
         self.scan_task = asyncio.create_task(self._scan_task(trigger))

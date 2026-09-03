@@ -361,6 +361,14 @@ class ProgressCoalescer:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
 
+    def reset(self) -> None:
+        """Start a new logical operation with an immediate first render."""
+        self._first_render = True
+        self._latest = None
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
     async def _run(self) -> None:
         while not self._closed and self._latest is not None:
             if self.interval and not self._first_render:
