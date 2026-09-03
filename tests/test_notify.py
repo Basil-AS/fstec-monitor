@@ -205,6 +205,44 @@ def test_notify_pending_splits_oversized_digest(monkeypatch, tmp_path):
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
+def test_partial_digest_delivery_records_successful_parts(monkeypatch, tmp_path):
+    """A failed later chunk must not cause successful chunks to be resent."""
+    session = _session(tmp_path)
+    document = Document(canonical_url="https://example.test/doc", title="Doc")
+    session.add(document)
+    session.flush()
+    session.add_all([
+        Event(
+            document_id=document.id,
+            kind="document_added",
+            severity="info",
+            summary=f"Документ {index} " + "x" * 240,
+        )
+        for index in range(30)
+    ])
+    session.commit()
+
+    class PartialFailureClient(_TelegramClient):
+        attempts = 0
+
+        async def post(self, url, **kwargs):
+            self.attempts += 1
+            if self.attempts == 2:
+                raise httpx.ReadTimeout("Telegram timed out after accepting an earlier chunk")
+            return await super().post(url, **kwargs)
+
+    client = PartialFailureClient()
+    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+
+    assert asyncio.run(notify_module.notify_pending(session)) == 1
+    deliveries = session.scalars(select(EventDelivery)).all()
+    assert 0 < len(deliveries) < 30
+    assert session.scalar(select(Event).where(Event.notified.is_(False))) is not None
+
+
 def test_notify_pending_silences_an_already_delivered_error(monkeypatch, tmp_path):
     session = _session(tmp_path)
     session.add(Event(kind="fetch_error", severity="warning", summary="Сайт недоступен", notified=True))

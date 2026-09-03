@@ -342,8 +342,7 @@ async def _deliver_to_recipients(
             for parts, message_events in messages:
                 if not message_events or not parts:
                     continue
-                delivered_digest = True
-                for message, _ in parts:
+                for message, part_events in parts:
                     try:
                         await _post_notification(
                             client,
@@ -357,13 +356,11 @@ async def _deliver_to_recipients(
                         )
                     except (httpx.HTTPError, RuntimeError) as exc:
                         log.warning("notification digest failed chat=%s: %s", chat_id, exc)
-                        delivered_digest = False
                         break
-                    sent += 1
-                if delivered_digest:
-                    for event in message_events:
+                    for event in part_events:
                         session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
                     session.commit()
+                    sent += 1
     return sent
 
 
