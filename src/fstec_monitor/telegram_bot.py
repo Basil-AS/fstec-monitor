@@ -1093,7 +1093,15 @@ class TelegramBot:
             return True
         if action == "nav" and value == "back":
             stack = self._navigation_stack(chat_id or sender_id)
-            await self._render_screen(chat_id or sender_id, stack.back(), reset=True, source_message=message, reason="back")
+            screen, payload = stack.back_frame()
+            await self._render_screen(
+                chat_id or sender_id,
+                screen,
+                reset=True,
+                source_message=message,
+                reason="back",
+                payload=payload,
+            )
             return True
         if action == "screen":
             if value.startswith("changes-page-"):
