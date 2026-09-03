@@ -317,7 +317,13 @@ async def _deliver_to_recipients(
             ).all())
             ignored = ignored_by_user.get(user_by_chat.get(chat_id), set())
 
-            def visible(event: Event, ignored: set[str] = ignored) -> bool:
+            def visible(
+                event: Event,
+                ignored: set[str] = ignored,
+                recipient_chat_id: int = chat_id,
+            ) -> bool:
+                if recipient_chat_id == settings.telegram_admin_id:
+                    return True
                 document = documents.get(event.document_id) if event.document_id else None
                 return not ignored or not document or category_key(document.category) not in ignored
 
