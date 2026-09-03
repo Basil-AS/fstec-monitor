@@ -2,6 +2,7 @@ import asyncio
 from typing import ClassVar
 
 import httpx
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -69,7 +70,27 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
-def test_notify_pending_retries_transient_telegram_transport_failure(monkeypatch, tmp_path):
+def test_notification_timeout_is_not_retried_after_unknown_telegram_outcome(monkeypatch):
+    calls = 0
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise httpx.ReadTimeout("Telegram response timed out")
+
+    async def fail_sleep(_delay):
+        raise AssertionError("an unknown sendMessage outcome must not be retried")
+
+    monkeypatch.setattr(notify_module.asyncio, "sleep", fail_sleep)
+
+    with pytest.raises(httpx.ReadTimeout):
+        asyncio.run(notify_module._post_notification(Client(), "https://example.test", {"text": "x"}))
+
+    assert calls == 1
+
+
+def test_notify_pending_does_not_retry_unknown_telegram_transport_outcome(monkeypatch, tmp_path):
     session = _session(tmp_path)
     session.add(Event(kind="document_added", severity="info", summary="Новый документ"))
     session.commit()
@@ -91,8 +112,38 @@ def test_notify_pending_retries_transient_telegram_transport_failure(monkeypatch
     monkeypatch.setattr(notify_module.settings, "max_retries", 2)
     monkeypatch.setattr(notify_module.settings, "request_delay_seconds", 0)
 
-    assert asyncio.run(notify_module.notify_pending(session)) == 1
-    assert client.attempts == 2
+    assert asyncio.run(notify_module.notify_pending(session)) == 0
+    assert client.attempts == 1
+    assert session.scalar(select(Event).where(Event.notified.is_(False))) is not None
+
+
+def test_post_notification_retries_explicit_retryable_http_status(monkeypatch):
+    calls = 0
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.request = httpx.Request("POST", "https://example.test")
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("retryable", request=self.request, response=self)
+
+        def json(self):
+            return {"ok": True}
+
+    class Client:
+        async def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return Response(503 if calls == 1 else 200)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(notify_module.asyncio, "sleep", no_sleep)
+    asyncio.run(notify_module._post_notification(Client(), "https://example.test", {"text": "x"}))
+    assert calls == 2
 
 
 def test_attachment_variants_are_deduplicated_per_document():
