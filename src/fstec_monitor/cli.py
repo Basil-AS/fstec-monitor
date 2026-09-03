@@ -39,3 +39,7 @@ def events(limit:int=50):
     with SessionLocal() as s:
         for e in s.scalars(select(Event).order_by(Event.id.desc()).limit(limit)):
             console.print(f"{e.created_at} [{e.severity}] {e.kind}: {e.summary}")
+
+
+if __name__ == "__main__":
+    app()
