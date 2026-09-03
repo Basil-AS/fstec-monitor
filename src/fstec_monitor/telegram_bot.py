@@ -367,7 +367,7 @@ class TelegramBot:
             if close is not None:
                 try:
                     await close()
-                except Exception as exc:  # cleanup must not mask upload result
+                except (OSError, RuntimeError, httpx.HTTPError) as exc:  # cleanup must not mask upload result
                     log.debug("could not close Telegram upload response: %s", exc)
         result = body.get("result") or {}
         message_id = result.get("message_id") if isinstance(result, dict) else None
