@@ -38,6 +38,13 @@ def test_api_url_uses_shared_local_bot_api():
     )
 
 
+def test_callback_access_boundary_rejects_admin_screens_for_non_admin():
+    bot = TelegramBot.__new__(TelegramBot)
+
+    assert bot._callback_access_allowed("screen", "users", 42) is False
+    assert bot._callback_access_allowed("screen", "changes", 42) is True
+
+
 def test_update_envelope_routing_keeps_callback_and_message_paths_separate():
     import asyncio
 

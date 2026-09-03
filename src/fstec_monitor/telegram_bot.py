@@ -1265,6 +1265,18 @@ class TelegramBot:
                 return True
         return False
 
+    def _callback_access_allowed(self, action: str, value: str, sender_id: int | None) -> bool:
+        """Check the cheap role boundary before dispatching callback work."""
+        admin_screens = {"status", "scan", "settings", "filters", "users", "errors"}
+        admin_user = is_admin(sender_id, settings.telegram_admin_id)
+        return admin_user or not ((action == "screen" and value in admin_screens) or action == "settings")
+
+    def _callback_user_is_allowed(self, sender_id: int | None) -> bool:
+        if not sender_id:
+            return False
+        with SessionLocal() as session:
+            return is_allowed(session.get(UserAccess, sender_id))
+
     async def _handle_access_decision(self, value: str, reply) -> None:
         """Settle an access request exactly once and close its action buttons."""
         try:
@@ -1468,15 +1480,11 @@ class TelegramBot:
             return
         if decoded:
             action, value = decoded
-            admin_screens = {"status", "scan", "settings", "filters", "users", "errors"}
             admin_user = is_admin(sender_id, settings.telegram_admin_id)
-            if ((action == "screen" and value in admin_screens) or action == "settings") and not admin_user:
+            if not self._callback_access_allowed(action, value, sender_id):
                 return
-            if not admin_user:
-                with SessionLocal() as session:
-                    user = session.get(UserAccess, sender_id) if sender_id else None
-                if not is_allowed(user):
-                    return
+            if not admin_user and not self._callback_user_is_allowed(sender_id):
+                return
             if await self._dispatch_decoded_callback(
                 action, value, chat_id, sender_id, message, message_id, reply
             ):
