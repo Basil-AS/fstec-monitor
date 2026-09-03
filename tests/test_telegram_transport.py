@@ -35,7 +35,7 @@ def test_send_uses_html_only_for_explicit_markup_and_logs_metadata(monkeypatch, 
     assert "token" not in caplog.text.casefold()
 
 
-def test_chat_action_and_callback_toast_are_recorded_as_metadata(monkeypatch) -> None:
+def test_chat_action_and_callback_toast_are_recorded_as_metadata(monkeypatch, caplog) -> None:
     bot = TelegramBot.__new__(TelegramBot)
     calls = []
 
@@ -48,14 +48,16 @@ def test_chat_action_and_callback_toast_are_recorded_as_metadata(monkeypatch) ->
 
     async def scenario():
         await bot.send_chat_action(7, "upload_document")
-        await bot.answer_callback("callback-1", "Сохранено")
+        await bot.answer_callback("callback-1", "Сохранено", chat_id=7)
 
-    asyncio.run(scenario())
+    with caplog.at_level("INFO"):
+        asyncio.run(scenario())
 
     assert calls == [
         ("sendChatAction", {"chat_id": 7, "action": "upload_document"}),
         ("answerCallbackQuery", {"callback_query_id": "callback-1", "text": "Сохранено"}),
     ]
+    assert "TGUX chat=7 method=answerCallbackQuery message_id=- screen=- reason=callback-toast" in caplog.text
 
 
 def test_markup_cleanup_has_a_dedicated_bot_api_method() -> None:

@@ -231,10 +231,18 @@ class TelegramBot:
                 await asyncio.sleep(min(30.0, 2.0 ** attempt))
         raise RuntimeError(f"Telegram API call exhausted retries: {method}")
 
-    def _log_tgux(self, method: str, payload: dict, *, screen: str | None = None, reason: str = "api") -> None:
+    def _log_tgux(
+        self,
+        method: str,
+        payload: dict,
+        *,
+        chat_id: int | None = None,
+        screen: str | None = None,
+        reason: str = "api",
+    ) -> None:
         if os.getenv("FSTEC_TGUX_LOGGING", "0").casefold() not in {"1", "true", "yes", "on"}:
             return
-        chat_id = payload.get("chat_id", "?")
+        chat_id = payload.get("chat_id", chat_id if chat_id is not None else "?")
         message_id = payload.get("message_id", "-")
         log.info("TGUX chat=%s method=%s message_id=%s screen=%s reason=%s", chat_id, method, message_id, screen or "-", reason)
 
@@ -282,11 +290,11 @@ class TelegramBot:
         self._log_tgux("editMessageReplyMarkup", payload, reason="stale-media-keyboard")
         await self.call("editMessageReplyMarkup", payload)
 
-    async def answer_callback(self, callback_query_id: str, text: str = "") -> None:
+    async def answer_callback(self, callback_query_id: str, text: str = "", *, chat_id: int | None = None) -> None:
         payload = {"callback_query_id": callback_query_id}
         if text:
             payload["text"] = text[:200]
-        self._log_tgux("answerCallbackQuery", payload, reason="callback-toast")
+        self._log_tgux("answerCallbackQuery", payload, chat_id=chat_id, reason="callback-toast")
         await self.call("answerCallbackQuery", payload)
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
@@ -1014,7 +1022,13 @@ class TelegramBot:
             return "Открываю…"
         return "Обновлено"
 
-    async def _answer_callback(self, callback_id: str | None, raw_data: str, stale: bool) -> None:
+    async def _answer_callback(
+        self,
+        callback_id: str | None,
+        raw_data: str,
+        stale: bool,
+        chat_id: int | None = None,
+    ) -> None:
         """Acknowledge a callback before dispatching any potentially slow work."""
         if not callback_id:
             return
@@ -1026,9 +1040,11 @@ class TelegramBot:
         answer = getattr(self, "answer_callback", None)
         try:
             if answer is not None:
-                await answer(callback_id, toast)
+                await answer(callback_id, toast, chat_id=chat_id)
             else:
-                await self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": toast})
+                payload = {"callback_query_id": callback_id, "text": toast}
+                self._log_tgux("answerCallbackQuery", payload, chat_id=chat_id, reason="callback-toast")
+                await self.call("answerCallbackQuery", payload)
         except (OSError, RuntimeError, httpx.HTTPError) as exc:
             log.warning("answerCallbackQuery failed (expired query?): %s", exc)
 
@@ -1333,7 +1349,7 @@ class TelegramBot:
         sender = callback.get("from") or {}
         raw_data = callback.get("data") or ""
         callback_message, callback_chat_id, callback_message_id, stale_callback = self._adopt_callback_screen(callback)
-        await self._answer_callback(callback_id, raw_data, stale_callback)
+        await self._answer_callback(callback_id, raw_data, stale_callback, callback_chat_id)
 
         async def reply(text: str, markup: dict | None = None, fallback_chat_id: int | None = None) -> None:
             await self._reply_to_callback(callback, text, markup, fallback_chat_id)
