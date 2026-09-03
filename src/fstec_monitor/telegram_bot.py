@@ -350,15 +350,25 @@ class TelegramBot:
 
     async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> int | None:
         await self.send_chat_action(chat_id, "upload_document")
-        response = await self.client.post(
-            api_url(settings.telegram_api_root, self.token, "sendDocument"),
-            data={"chat_id": str(chat_id), "caption": caption[:900]},
-            files={"document": (name, data, "text/markdown" if name.endswith(".md") else "application/octet-stream")},
-        )
-        response.raise_for_status()
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
+        response = None
+        try:
+            response = await self.client.post(
+                api_url(settings.telegram_api_root, self.token, "sendDocument"),
+                timeout=settings.telegram_upload_timeout_seconds,
+                data={"chat_id": str(chat_id), "caption": caption[:900]},
+                files={"document": (name, data, "text/markdown" if name.endswith(".md") else "application/octet-stream")},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("ok"):
+                raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
+        finally:
+            close = getattr(response, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except (OSError, RuntimeError, httpx.HTTPError) as exc:  # cleanup must not mask upload result
+                    log.debug("could not close Telegram upload response: %s", exc)
         result = body.get("result") or {}
         message_id = result.get("message_id") if isinstance(result, dict) else None
         payload = {"chat_id": chat_id}

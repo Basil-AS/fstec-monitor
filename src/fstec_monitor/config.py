@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     tls_verify: bool = True
     storage_quota_bytes: int = 5 * 1024 * 1024 * 1024
     telegram_max_file_bytes: int = 45 * 1024 * 1024
+    telegram_upload_timeout_seconds: float = 120.0
     max_concurrency: int = 8
     attachment_audit_interval_seconds: int = 86400
     ignored_categories: str = ""

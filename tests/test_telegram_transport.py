@@ -90,6 +90,37 @@ def test_persistent_document_telemetry_records_returned_message_id(monkeypatch, 
     assert "TGUX chat=7 method=sendDocument message_id=99 screen=- reason=persistent-report" in caplog.text
 
 
+def test_send_file_uses_bounded_upload_timeout_and_closes_response() -> None:
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.token = "token"
+    requests = []
+
+    async def call(method, payload):
+        assert method == "sendChatAction"
+        return True
+
+    class Response:
+        async def aclose(self):
+            requests.append("closed")
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 100}}
+
+    class Client:
+        async def post(self, *args, **kwargs):
+            requests.append(kwargs["timeout"])
+            return Response()
+
+    bot.call = call
+    bot.client = Client()
+
+    assert asyncio.run(bot.send_file(7, "report.md", b"# report")) == 100
+    assert requests == [120.0, "closed"]
+
+
 def test_markup_cleanup_has_a_dedicated_bot_api_method() -> None:
     bot = TelegramBot.__new__(TelegramBot)
     calls = []
