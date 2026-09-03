@@ -9,6 +9,7 @@ import httpx
 from .config import settings
 
 _ATTACHMENT_SUFFIXES = (".odt", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".zip", ".rar", ".7z")
+_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def request_timeout(url: str) -> float:
@@ -35,6 +36,17 @@ def conditional_headers(etag: str = "", last_modified: str = "") -> dict[str, st
     return headers
 
 
+def retry_delay(attempt: int, response=None) -> float:
+    """Return bounded retry delay, honoring an upstream Retry-After hint."""
+    raw = getattr(response, "headers", {}).get("retry-after") if response is not None else None
+    if raw:
+        try:
+            return min(60.0, max(0.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return min(60.0, 5 * (2**attempt))
+
+
 async def close_response(response) -> None:
     """Close async HTTP streams without assuming a synchronous response."""
     close_async = getattr(response, "aclose", None)
@@ -56,12 +68,14 @@ class Fetcher:
             async with asyncio.timeout(total_timeout):
                 last=None
                 for attempt in range(settings.max_retries):
+                    retry_response = None
                     try:
                         delay = settings.request_delay_seconds
                         await asyncio.sleep(delay + random.random() * delay)
                         request_kwargs = {"headers": request_headers(url, headers), "timeout": total_timeout}
                         r=await self.client.get(url, **request_kwargs)
-                        if r.status_code in {429,500,502,503,504}:
+                        if r.status_code in _RETRYABLE_STATUS_CODES:
+                            retry_response = r
                             error = httpx.HTTPStatusError("retryable", request=r.request, response=r)
                             await close_response(r)
                             raise error
@@ -70,7 +84,7 @@ class Fetcher:
                     except (httpx.TransportError,httpx.HTTPStatusError) as e:
                         last=e
                         if attempt + 1 < settings.max_retries:
-                            await asyncio.sleep(min(60, 5*(2**attempt)))
+                            await asyncio.sleep(retry_delay(attempt, retry_response))
         except TimeoutError as exc:
             raise RuntimeError(f"failed to fetch {url}: overall timeout after {total_timeout}s") from exc
         if last is None:
