@@ -17,6 +17,7 @@ from fstec_monitor.notify import (
 from fstec_monitor.reports import event_report, event_report_md
 from fstec_monitor.storage import ObjectStore
 from fstec_monitor.telegram.lifecycle import MessageLifecycleManager
+from fstec_monitor.telegram.list_views import paginate_lines
 from fstec_monitor.telegram.navigation import NavigationStack
 from fstec_monitor.telegram_bot import (
     ScanProgress,
@@ -1083,6 +1084,36 @@ def test_admin_user_actions_use_versioned_callback_protocol(tmp_db):
 
     callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
     assert callbacks == ["v1:access:approve-42", "v1:access:deny-42"]
+
+
+def test_admin_user_requests_are_paginated(tmp_db):
+    with tmp_db() as session:
+        session.add_all([
+            UserAccess(user_id=100 + index, chat_id=100 + index, status="pending")
+            for index in range(6)
+        ])
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    text, markup = bot.users_text()
+
+    assert "страница 1/2" in text
+    assert len(markup["inline_keyboard"]) == 6  # five users + pager
+    pager = markup["inline_keyboard"][-1]
+    assert pager[2]["callback_data"] == "v1:screen:users-page-1"
+
+
+def test_paginate_lines_keeps_page_bounds_and_reports_page_count():
+    page, number, total = paginate_lines(["a", "b", "c", "d", "e"], page=1, page_size=2)
+
+    assert page == ["c", "d"]
+    assert number == 1
+    assert total == 3
+
+    page, number, total = paginate_lines(["a"], page=99, page_size=2)
+    assert page == ["a"]
+    assert number == 0
+    assert total == 1
 
 
 def test_send_report_always_attaches_markdown_diff(tmp_db, tmp_path, monkeypatch):
