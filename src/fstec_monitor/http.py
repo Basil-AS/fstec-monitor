@@ -18,6 +18,14 @@ def request_timeout(url: str) -> float:
     return settings.document_timeout_seconds
 
 
+def request_headers(url: str, headers: dict[str, str] | None = None) -> dict[str, str] | None:
+    """Prepare request headers, avoiding fragile compression for large binaries."""
+    result = dict(headers or {})
+    if urlparse(url).path.casefold().endswith(_ATTACHMENT_SUFFIXES):
+        result.setdefault("Accept-Encoding", "identity")
+    return result or None
+
+
 def conditional_headers(etag: str = "", last_modified: str = "") -> dict[str, str]:
     headers = {}
     if etag:
@@ -51,7 +59,7 @@ class Fetcher:
                     try:
                         delay = settings.request_delay_seconds
                         await asyncio.sleep(delay + random.random() * delay)
-                        request_kwargs = {"headers": headers, "timeout": total_timeout}
+                        request_kwargs = {"headers": request_headers(url, headers), "timeout": total_timeout}
                         r=await self.client.get(url, **request_kwargs)
                         if r.status_code in {429,500,502,503,504}:
                             error = httpx.HTTPStatusError("retryable", request=r.request, response=r)
