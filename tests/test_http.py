@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from fstec_monitor.http import Fetcher, request_headers, request_timeout
+from fstec_monitor.http import Fetcher, request_headers, request_timeout, retry_delay
 
 
 def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
@@ -28,6 +28,14 @@ def test_fetcher_does_not_backoff_after_final_attempt(monkeypatch):
         asyncio.run(fetcher.get("https://example.test"))
 
     assert sleeps == [0, 5, 0]
+
+
+def test_retry_delay_honors_retry_after_without_exceeding_cap():
+    response = SimpleNamespace(headers={"retry-after": "17"})
+
+    assert retry_delay(0, response) == 17
+    assert retry_delay(0, SimpleNamespace(headers={"retry-after": "999"})) == 60
+    assert retry_delay(1, SimpleNamespace(headers={"retry-after": "invalid"})) == 10
 
 
 def test_fetcher_uses_longer_timeout_for_binary_attachments(monkeypatch):
