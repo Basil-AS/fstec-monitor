@@ -40,6 +40,7 @@ from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
 from .telegram.change_views import paginate_change_groups, visible_change_groups
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
+from .telegram.list_views import paginate_lines, pagination_row
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
 from .telegram.rendering import escape_html, has_html_markup, render_scan_progress
 from .telegram.ux.callbacks import CallbackCodec
@@ -742,14 +743,15 @@ class TelegramBot:
         ]]
         return text, controls
 
-    def users_text(self) -> tuple[str, dict | None]:
+    def users_text(self, page: int = 0) -> tuple[str, dict | None]:
         with SessionLocal() as session:
             users = session.scalars(select(UserAccess).where(UserAccess.status == "pending").order_by(UserAccess.requested_at)).all()
         if not users:
             return "Новых заявок на доступ нет.", None
-        lines = [f"Заявки на доступ: {len(users)}"]
+        page_users, page, pages = paginate_lines(users, page, 5)
+        lines = [f"Заявки на доступ: {len(users)} · страница {page + 1}/{pages}"]
         buttons = []
-        for user in users:
+        for user in page_users:
             identity = f"@{user.username}" if user.username else user.display_name or "без имени"
             lines.append(f"{identity} — ID {user.user_id}")
             buttons.append([
@@ -762,6 +764,11 @@ class TelegramBot:
                     "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user.user_id}"),
                 },
             ])
+        if pages > 1:
+            buttons.append(pagination_row(
+                page, pages,
+                lambda target: telegram_keyboards.encode_callback("screen", f"users-page-{target}"),
+            ))
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def ignored_categories_db(self) -> list[str]:
@@ -801,20 +808,26 @@ class TelegramBot:
             session.commit()
             return f"🚫 Категория скрыта из ваших уведомлений: {target}"
 
-    def user_ignore_text(self, user_id: int) -> tuple[str, dict | None]:
+    def user_ignore_text(self, user_id: int, page: int = 0) -> tuple[str, dict | None]:
         ignored = self.user_ignored_categories(user_id)
         ignored_keys = {category_key(c) for c in ignored}
         with SessionLocal() as session:
             known = sorted(c for c in session.scalars(select(Document.category).distinct()).all() if c)
         lines = ["🚫 Мои категории", "Выберите категории, по которым не получать уведомления:"]
         lines.append("Скрыты: " + ", ".join(ignored) if ignored else "Скрытых категорий нет")
+        page_categories, page, pages = paginate_lines(known, page, 8)
         buttons = []
-        for category in known[:30]:
+        for category in page_categories:
             hidden = category_key(category) in ignored_keys
             buttons.append([{
                 "text": f"{'✅' if hidden else '👁️'} {category[:40]}",
                 "callback_data": telegram_keyboards.encode_callback("userignore", category_token(category)),
             }])
+        if pages > 1:
+            buttons.append(pagination_row(
+                page, pages,
+                lambda target: telegram_keyboards.encode_callback("screen", f"my-ignore-page-{target}"),
+            ))
         return "\n".join(lines), {"inline_keyboard": buttons} if buttons else None
 
     def set_ignored_categories_db(self, categories: list[str]) -> None:
@@ -994,10 +1007,12 @@ class TelegramBot:
             text, markup = await asyncio.to_thread(self.ignore_text)
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []) if markup else [])
         elif screen == "my_ignore":
-            text, markup = await asyncio.to_thread(self.user_ignore_text, chat_id)
+            page = payload.get("page", 0) if isinstance(payload, dict) else 0
+            text, markup = await asyncio.to_thread(self.user_ignore_text, chat_id, page)
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []) if markup else [])
         elif screen == "users":
-            text, markup = await asyncio.to_thread(self.users_text)
+            page = payload.get("page", 0) if isinstance(payload, dict) else 0
+            text, markup = await asyncio.to_thread(self.users_text, page)
             view = screen_with_navigation(screen, text, markup.get("inline_keyboard", []) if markup else [])
         elif screen == "errors":
             with SessionLocal() as session:
@@ -1135,6 +1150,18 @@ class TelegramBot:
                     stack = self._navigation_stack(chat_id or sender_id)
                     stack.replace("changes", {"page": int(page)})
                     await self._render_screen(chat_id or sender_id, "changes", source_message=message, payload={"page": int(page)})
+                return True
+            if value.startswith(("users-page-", "my-ignore-page-")):
+                prefix, raw_page = value.rsplit("-", 1)
+                target = chat_id or sender_id
+                if target is not None and raw_page.isdigit():
+                    page = int(raw_page)
+                    screen = "users" if prefix == "users-page" else "my_ignore"
+                    stack = self._navigation_stack(target)
+                    stack.replace(screen, {"page": page})
+                    await self._render_screen(
+                        target, screen, source_message=message, payload={"page": page}, reason="pagination"
+                    )
                 return True
             await self._render_screen(chat_id or sender_id, value, source_message=message)
             return True
