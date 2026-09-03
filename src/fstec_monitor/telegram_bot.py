@@ -1609,15 +1609,14 @@ class TelegramBot:
         elif command == "/settings":
             await self._render_screen(chat_id, "settings", reset=True)
 
-    async def handle(self, update: dict) -> None:
+    async def _handle_callback_update(self, callback: dict) -> None:
+        try:
+            await self.handle_callback(callback)
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+            await self.report_error("ошибка обработки callback", exc)
+
+    async def _handle_message_update(self, message: dict) -> None:
         started_at = time.monotonic()
-        if update.get("callback_query"):
-            try:
-                await self.handle_callback(update["callback_query"])
-            except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
-                await self.report_error("ошибка обработки callback", exc)
-            return
-        message = update.get("message") or {}
         sender = message.get("from") or {}
         chat_id = (message.get("chat") or {}).get("id")
         text = (message.get("text") or "").strip()
@@ -1652,6 +1651,13 @@ class TelegramBot:
             )
         finally:
             log.info("command %s took %.2fs", command, time.monotonic() - started_at)
+
+    async def handle(self, update: dict) -> None:
+        """Route Telegram update envelopes to one focused execution path."""
+        if update.get("callback_query"):
+            await self._handle_callback_update(update["callback_query"])
+            return
+        await self._handle_message_update(update.get("message") or {})
 
     async def handle_update_safely(self, update: dict) -> None:
         """Keep one malformed update from terminating the long-poll loop."""
