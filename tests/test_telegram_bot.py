@@ -17,6 +17,7 @@ from fstec_monitor.notify import (
 from fstec_monitor.reports import event_report, event_report_md
 from fstec_monitor.storage import ObjectStore
 from fstec_monitor.telegram.lifecycle import MessageLifecycleManager
+from fstec_monitor.telegram.navigation import NavigationStack
 from fstec_monitor.telegram_bot import (
     ScanProgress,
     TelegramBot,
@@ -34,6 +35,38 @@ def test_api_url_uses_shared_local_bot_api():
     assert api_url("http://127.0.0.1:8081", "token", "getUpdates") == (
         "http://127.0.0.1:8081/bottoken/getUpdates"
     )
+
+
+def test_back_callback_renders_previous_payload_context():
+    import asyncio
+
+    bot = TelegramBot.__new__(TelegramBot)
+    stack = NavigationStack()
+    stack.reset("main")
+    stack.push("changes", {"page": 3})
+    stack.push("event", {"event_id": 512})
+    bot.navigation = {7: stack}
+    rendered = []
+
+    async def render_screen(chat_id, screen, **kwargs):
+        rendered.append((chat_id, screen, kwargs))
+
+    bot._render_screen = render_screen
+
+    async def reply(*_args, **_kwargs):
+        raise AssertionError("Back should render the previous screen")
+
+    handled = asyncio.run(bot._dispatch_decoded_callback(
+        "nav", "back", 7, 7, {}, 22, reply
+    ))
+
+    assert handled is True
+    assert rendered == [(7, "changes", {
+        "reset": True,
+        "source_message": {},
+        "reason": "back",
+        "payload": {"page": 3},
+    })]
 
 
 def test_idempotent_telegram_api_call_retries_transient_timeout(monkeypatch):
