@@ -297,7 +297,13 @@ def _notification_context(session, candidate_events: list[Event]):
         ).all()
         for row in ignored_rows:
             ignored_by_user.setdefault(row.user_id, set()).add(row.category_key)
-    return documents, user_by_chat, ignored_by_user
+    global_ignore_setting = session.get(BotSetting, "ignored_categories")
+    globally_ignored = {
+        category_key(value)
+        for value in (global_ignore_setting.value if global_ignore_setting else "").splitlines()
+        if value.strip()
+    }
+    return documents, user_by_chat, ignored_by_user, globally_ignored
 
 
 async def _deliver_to_recipients(
@@ -309,6 +315,7 @@ async def _deliver_to_recipients(
     documents: dict[int, Document],
     user_by_chat: dict[int, int],
     ignored_by_user: dict[int, set[str]],
+    globally_ignored: set[str],
 ) -> int:
     sent = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
@@ -316,15 +323,12 @@ async def _deliver_to_recipients(
             delivered = set(session.scalars(
                 select(EventDelivery.event_id).where(EventDelivery.chat_id == chat_id)
             ).all())
-            ignored = ignored_by_user.get(user_by_chat.get(chat_id), set())
+            ignored = globally_ignored | ignored_by_user.get(user_by_chat.get(chat_id), set())
 
             def visible(
                 event: Event,
                 ignored: set[str] = ignored,
-                recipient_chat_id: int = chat_id,
             ) -> bool:
-                if recipient_chat_id == settings.telegram_admin_id:
-                    return True
                 document = documents.get(event.document_id) if event.document_id else None
                 return not ignored or not document or category_key(document.category) not in ignored
 
@@ -420,10 +424,10 @@ async def notify_pending(session) -> int:
     candidate_events = error_events + unique_events
     if not candidate_events:
         return 0
-    documents, user_by_chat, ignored_by_user = _notification_context(session, candidate_events)
+    documents, user_by_chat, ignored_by_user, globally_ignored = _notification_context(session, candidate_events)
     sent = await _deliver_to_recipients(
         session, recipients, candidate_events, error_events, unique_events,
-        documents, user_by_chat, ignored_by_user,
+        documents, user_by_chat, ignored_by_user, globally_ignored,
     )
 
     for event in candidate_events:

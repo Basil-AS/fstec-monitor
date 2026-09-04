@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 import fstec_monitor.notify as notify_module
 from fstec_monitor.models import (
     Base,
+    BotSetting,
     Document,
     Event,
     EventDelivery,
@@ -351,7 +352,35 @@ def test_notify_pending_applies_personal_category_ignore(monkeypatch, tmp_path):
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
-def test_admin_notification_ignores_personal_category_filter(monkeypatch, tmp_path):
+def test_notify_pending_applies_global_ignore_to_admin(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    document = Document(
+        canonical_url="https://example.test/ignored-admin",
+        title="Ignored for admin",
+        category="Приказы",
+    )
+    session.add(document)
+    session.flush()
+    session.add_all([
+        BotSetting(key="ignored_categories", value="Приказы"),
+        Event(document_id=document.id, kind="document_added", severity="info", summary="Не отправлять"),
+    ])
+    session.commit()
+    _TelegramClient.calls = []
+    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
+    monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
+    monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
+
+    sent = asyncio.run(notify_module.notify_pending(session))
+
+    assert sent == 0
+    assert _TelegramClient.calls == []
+    assert len(session.scalars(select(EventDelivery)).all()) == 1
+    assert session.scalar(select(Event).where(Event.document_id == document.id)).notified is True
+
+
+def test_admin_notification_applies_personal_category_filter(monkeypatch, tmp_path):
     session = _session(tmp_path)
     document = Document(
         canonical_url="https://example.test/hidden-from-user",
@@ -376,6 +405,6 @@ def test_admin_notification_ignores_personal_category_filter(monkeypatch, tmp_pa
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 151599744)
 
-    assert asyncio.run(notify_module.notify_pending(session)) == 1
-    message = _TelegramClient.calls[0][1]["json"]["text"]
-    assert "Важно админу" in message
+    assert asyncio.run(notify_module.notify_pending(session)) == 0
+    assert _TelegramClient.calls == []
+    assert len(session.scalars(select(EventDelivery)).all()) == 1
