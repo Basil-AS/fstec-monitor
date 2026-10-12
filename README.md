@@ -23,8 +23,12 @@
 
 Уведомления сгруппированы: один запуск отправляет одну сводку содержательных
 изменений и одну сводку новых ошибок. Ответы `304`, повторные одинаковые
-ошибки, изменения только HTML-разметки и другие служебные события в личку не
-отправляются. Документ считается удалённым после двух последовательных полных
+ошибки, изменения только HTML-разметки, бинарные замены без текстовых правок и
+другие служебные события в личку не отправляются. Если изменившееся вложение
+нельзя надёжно сравнить по тексту, бот присылает отдельное предупреждение с
+ссылкой для ручной проверки. Типографические варианты дефиса/тире сводятся к
+одному символу только в сравнительном тексте; исходные байты и SHA-256 остаются
+в архиве. Документ считается удалённым после двух последовательных полных
 обходов без него; единичный сбой каталога не создаёт ложное удаление.
 
 Основные этапы запуска пишутся в journald/stdout: начало проверки, число
@@ -60,12 +64,27 @@ docker compose run --rm monitor fstec-monitor run
 
 ```dotenv
 FSTEC_TELEGRAM_BOT_TOKEN=123456:token
+FSTEC_TELEGRAM_ADMIN_ID=123456789
+FSTEC_TELEGRAM_API_ROOT=http://127.0.0.1:18081
+FSTEC_TELEGRAM_RICH_MESSAGES_ENABLED=true
 FSTEC_TELEGRAM_CHAT_ID=123456789
 FSTEC_STORAGE_QUOTA_BYTES=5368709120
 FSTEC_MAX_CONCURRENCY=8
 FSTEC_ATTACHMENT_AUDIT_INTERVAL_SECONDS=86400
 FSTEC_IGNORED_CATEGORIES=Информационные и аналитические материалы
 ```
+
+`FSTEC_TELEGRAM_ADMIN_ID` обязателен для запуска бота; значение по умолчанию
+отсутствует. Бот закрывает доступ при отсутствии ID администратора. Для штатной
+установки используется локальный Telegram Bot API по адресу
+`http://127.0.0.1:18081`; публичный `api.telegram.org` намеренно отклоняется.
+Сводки используют Rich Messages HTML при поддержке локального Bot API и
+переходят на `sendMessage` только при явном ответе о неподдерживаемом методе.
+Для поддержки Bot API 10.3 зависимость aiogram закреплена на upstream commit с
+исправлением экспоненциально медленной валидации вложенного RichText в Updates
+([aiogram #1934](https://github.com/aiogram/aiogram/pull/1934)). Обновляйте этот
+pin на стабильный aiogram release после включения исправления и повторной
+проверки регрессионного теста.
 
 После первого прохода повторная проверка не скачивает заново неизменившиеся
 страницы: серверу отправляются валидаторы, а ответ `304 Not Modified` не создаёт
@@ -78,21 +97,28 @@ FSTEC_IGNORED_CATEGORIES=Информационные и аналитическ�
 `🚫 Игнор категорий`, `⚙️ Настройки` и `ℹ️ Помощь`. Slash-команды остаются
 доступны для совместимости, но больше не используются как подписи кнопок.
 
-Одобренные обычные пользователи получают только сводки обновлений, последние
-изменения и кнопку `🚫 Мои категории`. Персональный ignore скрывает выбранные
+Права выдаются только пользователям, пишущим боту в личном чате; группы и
+пересланные callback-кнопки не выполняют команды. Все незарегистрированные
+пользователи по умолчанию закрыты. Первое обращение фиксируется в БД и создаёт
+заявку администратору; решение и повторная регистрация сохраняются в append-only
+журнале. Одобренные обычные пользователи получают только сводки обновлений,
+последние изменения и кнопку `🚫 Мои категории`. Персональный ignore скрывает выбранные
 категории только в уведомлениях этого пользователя и не отключает их сканирование.
 
 После запуска администратор может использовать:
 
-При `/start` бот автоматически показывает постоянную клавиатуру быстрых действий,
-а кнопка `☰` Telegram содержит тот же список команд.
+При `/start` бот показывает inline-панель. Меню команд Telegram содержит
+`/start`, `/help` и `/request_access` для личных чатов; у администратора также
+доступны служебные команды. Старые slash-команды продолжают работать.
 
 - `/status` — количество документов и вложений, даты последней проверки и изменения, статус изменений, квота, ошибки и длительность последних проверок (история хранится в таблице `scan_runs`);
 - `/changes 10` — последние содержательные события;
 - `/report 123` (или `/diff 123`) — всегда прикладывает файл `diff_123.md` с полным отчётом и unified diff «до/после», плюс старую/новую версию файла, если она помещается в лимит Telegram;
 - `/errors` — последние ошибки загрузки и хранения;
 - `/clear_errors` — очистка журнала ошибок (`fetch_error`, `storage_error`) с подтверждением; история документов и diff'ы не затрагивается;
-- `/users` — заявки пользователей на доступ и кнопки «разрешить/отклонить»;
+- `/users` — полный постраничный список зарегистрированных пользователей и заявок с текущим состоянием; кнопки меняются по состоянию: pending → approve/deny/block, approved → revoke/block, denied → approve/block, blocked → unblock (в denied). Каждое действие связано с показанными статусом и одноразовым nonce; устаревшие и повторные кнопки отклоняются;
+- `/access_history [user_id]` — журнал запросов и администраторских решений с actor ID и старым/новым статусом; журнал append-only;
+- `/request_access` — единственный путь пользователя из denied в pending; действие unblock переводит blocked в denied и само по себе доступ не выдаёт;
 - `/ignore` — список игнорируемых категорий и inline-кнопки для включения/выключения игнора по каждой известной категории (сохраняется в БД, действует вместе с `FSTEC_IGNORED_CATEGORIES`);
 - `/settings` — выбрать расписание: раз в сутки в 12:00, раз в сутки в 00:00,
   каждые 2 часа, выключить автозапуск или отдельно выключить уведомления;
@@ -106,8 +132,9 @@ FSTEC_IGNORED_CATEGORIES=Информационные и аналитическ�
 для нового запуска.
 
 Для экономии ресурсов включайте только один автоматический запуск: либо Telegram-бот
-с его внутренним расписанием, либо `fstec-monitor.timer`. Если включены оба режима,
-они могут одновременно начать одну и ту же проверку в 12:00.
+с его внутренним расписанием, либо отдельный `fstec-monitor-scan.timer`. При переходе
+со старой установки отключите system-level `fstec-monitor.timer`; параллельный timer
+и внутренний планировщик бота могут запустить два сканирования около полудня.
 
 При неизменившемся ответе серверу отправляются `ETag`/`Last-Modified`, а ответ
 `304 Not Modified` не создаёт новую версию и не записывает объект на диск. Новые
@@ -117,26 +144,124 @@ FSTEC_IGNORED_CATEGORIES=Информационные и аналитическ�
 не удаляет историю.
 
 HTML-уведомления и уведомления о вложениях содержат прямую ссылку на страницу
-документа. Повторяющиеся markup-only HTML-снимки не архивируются, чтобы не
-заполнять SSD; содержательные изменения и версии PDF/ODT сохраняются.
+документа. При markup-only изменении HTML новые исходные и нормализованные
+снимки сохраняются для аудита, но событие и уведомление не создаются; содержательные
+изменения и версии PDF/ODT сохраняются.
 
 ## systemd
 
-Рекомендуемые пути:
+### Telegram-бот на Teya
 
-- код: `/opt/fstec-monitor`;
-- venv: `/opt/fstec-monitor/.venv`;
-- env: `/etc/fstec-monitor.env`;
-- данные: `/var/lib/fstec-monitor`.
+Teya запускает ботов rootless systemd user units от `runtime`. Путь установки:
 
-В env укажите:
+- код: `/srv/runtime/apps/fstec-monitor`;
+- venv: `/srv/runtime/apps/fstec-monitor/.venv`;
+- общий admin/API env: `/srv/runtime/secrets/telegram-admin.env`;
+- секреты и настройки бота: `/srv/runtime/secrets/fstec-monitor.env`;
+- данные: `/srv/runtime/apps/fstec-monitor/data`.
 
-```dotenv
-FSTEC_DATABASE_URL=sqlite:////var/lib/fstec-monitor/fstec-monitor.db
-FSTEC_STORAGE_DIR=/var/lib/fstec-monitor/objects
+Скопируйте `systemd/fstec-monitor.service` в
+`/srv/runtime/.config/systemd/user/fstec-monitor.service`, укажите
+`FSTEC_TELEGRAM_BOT_TOKEN` в bot env. Администратор берётся из общего
+`TELEGRAM_ADMIN_ID` в `telegram-admin.env`; локальное значение не зашивается и
+при его отсутствии бот не запускается.
+
+При переходе с прежнего имени bot unit сначала остановите polling. Если старая
+версия работает как `fstec-monitor-bot.service`, выполните:
+
+```bash
+sudo systemctl --user -M runtime@ disable --now fstec-monitor-bot.service
 ```
 
-Затем скопируйте unit-файлы из `systemd/`, выполните `systemctl daemon-reload` и `systemctl enable --now fstec-monitor.timer`.
+Если предыдущая версия уже установлена в user scope как `fstec-monitor.service`,
+сначала остановите её:
+
+```bash
+sudo systemctl --user -M runtime@ stop fstec-monitor.service
+```
+
+Не включайте старый и новый unit одновременно. Если на хосте включён отдельный
+system-level timer сканера, отключите его до запуска внутреннего расписания бота:
+
+```bash
+sudo systemctl disable --now fstec-monitor.timer
+```
+
+После остановки прежнего polling установите новый шаблон и включите только
+канонический bot unit:
+
+```bash
+sudo install -D -m 0644 systemd/fstec-monitor.service /srv/runtime/.config/systemd/user/fstec-monitor.service
+sudo systemctl --user -M runtime@ daemon-reload
+sudo systemctl --user -M runtime@ enable --now fstec-monitor.service
+sudo systemctl --user -M runtime@ status fstec-monitor.service --no-pager
+sudo journalctl --user -M runtime@ -u fstec-monitor.service -n 100 --no-pager
+```
+
+Unit использует `Type=notify`: бот сообщает `READY=1` после проверки Bot API, а
+heartbeat раз в 30 секунд кормит `WatchdogSec=60s`. Если event loop зависнет,
+heartbeat прекратится и systemd перезапустит процесс. При запуске вне systemd
+(без `NOTIFY_SOCKET`) уведомления и heartbeat отключены. После старта проверьте
+`systemctl --user -M runtime@ show fstec-monitor.service -p Type -p WatchdogUSec`
+и `/status`: должны отображаться состояние планировщика и дата последнего
+сканирования.
+
+Unit использует центральный Bot API `127.0.0.1:18081` и `Restart=on-failure` с
+`RestartSec=5s`. `telegram-bot-api.service` установлен в том же user manager
+`runtime@`, поэтому unit объявляет `Wants=` и `After=` для best-effort запуска и
+порядка старта. `Requires=` намеренно не используется: после рестарта API или
+временной недоступности бот сможет повторить собственный запуск, а не останется
+в состоянии dependency-failed. При старте `get_me()` проверяет локальный API и
+credentials до READY: если API недоступен, процесс завершится, systemd повторит
+запуск через 5 секунд. Ресурсные ограничения соответствуют текущему cgroup
+профилю Teya: `MemoryHigh=768M`, `MemoryMax=1G`, `TasksMax=512`, `CPUWeight=100`.
+Данные SQLite и объектов находятся в
+`/srv/runtime/apps/fstec-monitor/data`; сохраняйте эту директорию при обновлении
+каталога приложения.
+
+### Контейнерный rollout (шаблон, пока не установлен)
+
+`systemd/fstec-monitor.container.in` — reviewed Quadlet template, который не
+подхватывается systemd автоматически. Release workflow публикует для каждого
+тега `v*` образ в GHCR с provenance и SBOM, затем создаёт GitHub Release.
+Текущий release image digest ещё не назначен: не подставляйте tag или выдуманный
+digest. После публикации образа сформируйте unit только с immutable GHCR reference:
+
+```bash
+python scripts/render_quadlet.py \\
+  --image "$FSTEC_MONITOR_IMAGE" \\
+  --output /srv/runtime/.config/containers/systemd/fstec-monitor.container
+```
+
+`FSTEC_MONITOR_IMAGE` должен иметь вид
+`ghcr.io/<owner>/<image>@sha256:<64 hex>`. Перед установкой проверьте
+сформированный unit и образ. Контейнер подключается к общей rootless сети
+`bots-net` и ходит к локальному Bot API по `http://telegram-bot-api:8081`; его
+unit упорядочен после `telegram-bot-api.service` в том же user manager. Состояние
+БД и файлов хранится на host в `/srv/runtime/apps/fstec-monitor/data`, env
+загружается из `/srv/runtime/secrets/fstec-monitor.env`. В unit нет host ports;
+root filesystem read-only, отдельный `/tmp`, capabilities сняты, а healthcheck
+проверяет только локальный Bot API без вывода credentials. Для отправки
+`READY=1` и watchdog container передаёт системные уведомления приложения.
+
+Остановите и отключите `fstec-monitor.service`, прежние bot units и отдельный
+scan timer до запуска контейнера. Бот содержит собственный scheduler; активным
+должен остаться ровно один scheduler. Не включайте контейнер и host service
+одновременно.
+
+При контейнерном запуске markup-only обновления HTML сохраняют новые исходные и
+нормализованные snapshots и обновляют validators для аудита, но не создают Event
+и уведомление. Изменения semantic text по-прежнему создают события; версия
+неизвлекаемого вложения требует ручной проверки.
+
+### Одноразовый сканер
+
+`systemd/fstec-monitor-scan.service` и `systemd/fstec-monitor-scan.timer` —
+отдельный system-level сценарий для запуска `fstec-monitor run`; он сохраняет
+данные в `/var/lib/fstec-monitor` и читает `/etc/fstec-monitor.env`. Используйте
+этот таймер только если сканированием управляет systemd. Не запускайте его
+одновременно с внутренним расписанием Telegram-бота. Для установок, где timer ещё
+имеет старое имя `fstec-monitor.timer`, отключите его перед запуском бота.
 
 ## Важные свойства
 

@@ -299,7 +299,7 @@ class Monitor:
                         doc,
                         attachment,
                         baseline,
-                        emit_changes=link.url in preferred_urls,
+                        emit_changes=not is_new and link.url in preferred_urls,
                     )
                 except StorageQuotaExceeded as exc:
                     self.event(
@@ -380,6 +380,7 @@ class Monitor:
             html_hash=sha(normalized_html); text_hash=sha(text)
             previous_semantic=doc.current_semantic_sha256 or (previous.semantic_sha256 if previous else "")
             previous_html=doc.current_html_sha256 or (previous.html_sha256 if previous else "")
+            raw_changed = bool(previous and previous.raw_sha256 and previous.raw_sha256 != sha(raw))
             semantic_changed, markup_changed = classify_page_change(
                 previous_semantic=previous_semantic,
                 current_semantic=text_hash,
@@ -395,11 +396,10 @@ class Monitor:
                 _, html_hash, text_hash = self._archive_page_snapshot(
                     s, doc, r, raw, normalized_html, text
                 )
-            elif markup_changed:
-                if not baseline:
-                    old_html=self.store.read(previous.normalized_html_object).decode(errors="replace")
-                    diff="\n".join(difflib.unified_diff(old_html.splitlines(),normalized_html.splitlines(),fromfile="old-html",tofile="new-html",n=2))[:12000]
-                    self.event(s,doc,"html_markup_changed","info",f"изменена HTML-разметка: {doc.title or url}",diff)
+            elif markup_changed or raw_changed:
+                # Preserve every new source representation for evidence and
+                # validators, but formatting/counter-only churn is not a change
+                # event and must not appear in user-facing history.
                 _, html_hash, text_hash = self._archive_page_snapshot(
                     s, doc, r, raw, normalized_html, text
                 )
@@ -435,7 +435,7 @@ class Monitor:
             return
         r.raise_for_status(); data=r.content
         digest,key=self.store.put(data,PathSuffix(att.url,r.headers.get("content-type","")))
-        if previous and previous.binary_sha256==digest:
+        if previous and previous.binary_sha256 == digest:
             previous.etag = r.headers.get("etag", "") or previous.etag
             previous.last_modified = r.headers.get("last-modified", "") or previous.last_modified
             return
@@ -445,12 +445,79 @@ class Monitor:
             r.headers.get("content-type", ""),
             att.url,
         )
-        sem=sha(text) if text else ""
-        _,text_key=self.store.put(text.encode(),".txt") if text else ("","")
-        s.add(AttachmentVersion(attachment_id=att.id,status_code=r.status_code,content_type=r.headers.get("content-type",""),content_length=len(data),binary_sha256=digest,semantic_sha256=sem,object_key=key,extracted_text_key=text_key,etag=r.headers.get("etag", ""),last_modified=r.headers.get("last-modified", "")))
-        if previous and not baseline and emit_changes:
-            same=bool(sem and sem==previous.semantic_sha256)
-            self.event(s,doc,"attachment_binary_changed" if same else "attachment_content_changed","info" if same else "critical",f"обновлено вложение: {att.display_name}",f"{att.url}\nold={previous.binary_sha256}\nnew={digest}\nsemantic_same={same}")
+        text = text or ""
+        sem = sha(text) if text else ""
+        _, text_key = self.store.put(text.encode(), ".txt") if text else ("", "")
+        s.add(AttachmentVersion(
+            attachment_id=att.id,
+            status_code=r.status_code,
+            content_type=r.headers.get("content-type", ""),
+            content_length=len(data),
+            binary_sha256=digest,
+            semantic_sha256=sem,
+            object_key=key,
+            extracted_text_key=text_key,
+            etag=r.headers.get("etag", ""),
+            last_modified=r.headers.get("last-modified", ""),
+        ))
+        if previous is None:
+            # The containing document/attachment-added event explains a first
+            # version; there is no prior content to compare or review request.
+            return
+
+        if baseline:
+            return
+
+        binary_details = (
+            f"{att.url}\n"
+            f"old_binary_sha256={previous.binary_sha256}\n"
+            f"new_binary_sha256={digest}\n"
+            f"old_object={previous.object_key}\n"
+            f"new_object={key}"
+        )
+        self.event(
+            s,
+            doc,
+            "attachment_binary_changed",
+            "info",
+            f"изменились бинарные данные вложения: {att.display_name}",
+            binary_details,
+        )
+
+        if not emit_changes:
+            return
+
+        previous_text_known = bool(previous.semantic_sha256 and previous.extracted_text_key)
+        current_text_known = bool(sem and text_key)
+        if previous_text_known and current_text_known:
+            if sem != previous.semantic_sha256:
+                old_text = self.store.read(previous.extracted_text_key).decode(errors="replace")
+                diff = "\n".join(difflib.unified_diff(
+                    old_text.splitlines(),
+                    text.splitlines(),
+                    fromfile="old semantic text",
+                    tofile="new semantic text",
+                    n=3,
+                ))[:12000]
+                self.event(
+                    s,
+                    doc,
+                    "attachment_content_changed",
+                    "critical",
+                    f"изменился текст вложения: {att.display_name}",
+                    diff,
+                )
+        else:
+            old_status = "available" if previous_text_known else "unavailable"
+            new_status = "available" if current_text_known else "unavailable"
+            self.event(
+                s,
+                doc,
+                "attachment_review_required",
+                "warning",
+                "изменено вложение, текст не удалось надёжно сравнить; проверьте оригинал",
+                f"{att.url}\nold_text_extraction={old_status}\nnew_text_extraction={new_status}\n{binary_details}",
+            )
 
 def PathSuffix(url,ctype):
     p=urlparse(url).path.lower()

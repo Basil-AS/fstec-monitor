@@ -1,5 +1,5 @@
 [Unit]
-Description=Run FSTEC monitor once daily at noon
+Description=Run standalone FSTEC monitor scan once daily at noon
 
 [Timer]
 OnCalendar=*-*-* 12:00:00

@@ -15,8 +15,47 @@ def sha(data: bytes | str) -> str:
     if isinstance(data, str): data = data.encode("utf-8")
     return hashlib.sha256(data).hexdigest()
 
+# Source snapshots preserve their exact bytes; normalized comparison text treats
+# common dash glyph substitutions as typography rather than content changes.
+TYPOGRAPHIC_HYPHENS = str.maketrans({"‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "﹣": "-", "－": "-"})
+INLINE_FORMATTING_TAGS = {"a", "b", "strong", "i", "em", "sup", "sub", "span", "code", "small", "mark"}
+
+
+def _canonical_characters(value: str) -> str:
+    return value.replace("\xa0", " ").replace("\u00ad", "").translate(TYPOGRAPHIC_HYPHENS)
+
+
 def normalize_space(value: str) -> str:
-    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+    return re.sub(r"\s+", " ", _canonical_characters(value)).strip()
+
+
+def normalize_extracted_text(value: str) -> str:
+    """Normalize layout whitespace while preserving paragraph boundaries."""
+    value = _canonical_characters(value).replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = re.split(r"\n[ \t]*\n+", value)
+    return "\n\n".join(text for part in paragraphs if (text := normalize_space(part)))
+
+
+def _normalize_markup_whitespace(fragment: BeautifulSoup) -> None:
+    for node in list(fragment.find_all(string=True)):
+        raw = str(node)
+        normalized = normalize_space(raw)
+        if not normalized:
+            previous = node.previous_sibling
+            following = node.next_sibling
+            if (
+                isinstance(previous, Tag)
+                and isinstance(following, Tag)
+                and previous.name in INLINE_FORMATTING_TAGS
+                and following.name in INLINE_FORMATTING_TAGS
+            ):
+                node.replace_with(" ")
+            else:
+                node.extract()
+            continue
+        leading = " " if raw[:1].isspace() else ""
+        trailing = " " if raw[-1:].isspace() else ""
+        node.replace_with(f"{leading}{normalized}{trailing}")
 
 def find_content_root(soup: BeautifulSoup) -> Tag:
     selectors = [
@@ -40,6 +79,7 @@ def normalize_document_html(html: str) -> tuple[str, str]:
             for a in ("rowspan", "colspan"):
                 if node.get(a): attrs[a] = node[a]
         node.attrs = attrs
+    _normalize_markup_whitespace(fragment)
     allowed = {"h1","h2","h3","h4","h5","h6","p","ol","ul","li","table","thead","tbody","tr","td","th","strong","b","em","i","sup","sub","br","a","div"}
     for node in list(fragment.find_all(True)):
         if node.name not in allowed and node.name not in {"html", "body"}: node.unwrap()

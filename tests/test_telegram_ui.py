@@ -22,8 +22,8 @@ def test_admin_and_user_keyboards_have_unique_labels_and_role_boundaries():
 
     assert len({button["text"] for button in admin}) == len(admin)
     assert len({button["text"] for button in user}) == len(user)
-    assert "🔍 Проверить сейчас" in {button["text"] for button in admin}
-    assert "🔍 Проверить сейчас" not in {button["text"] for button in user}
+    assert "🔍 Проверка" in {button["text"] for button in admin}
+    assert "🔍 Проверка" not in {button["text"] for button in user}
 
 
 def test_callbacks_round_trip_and_reject_untrusted_payloads():

@@ -1,17 +1,29 @@
 [Unit]
-Description=FSTEC document change monitor
-After=network-online.target
-Wants=network-online.target
+Description=FSTEC Monitor Telegram bot
+Wants=telegram-bot-api.service
+After=telegram-bot-api.service
 
 [Service]
-Type=oneshot
-User=fstec-monitor
-Group=fstec-monitor
-WorkingDirectory=/opt/fstec-monitor
-EnvironmentFile=/etc/fstec-monitor.env
-ExecStart=/opt/fstec-monitor/.venv/bin/fstec-monitor run
-NoNewPrivileges=true
-PrivateTmp=true
+Type=notify
+WorkingDirectory=/srv/runtime/apps/fstec-monitor
+EnvironmentFile=-/srv/runtime/secrets/telegram-admin.env
+EnvironmentFile=/srv/runtime/secrets/fstec-monitor.env
+Environment=TELEGRAM_API_ROOT=http://127.0.0.1:18081
+ExecStart=/srv/runtime/apps/fstec-monitor/.venv/bin/fstec-monitor-bot
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+WatchdogSec=60s
+TasksMax=512
+CPUWeight=100
+MemoryHigh=768M
+MemoryMax=1G
+NoNewPrivileges=yes
+PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/fstec-monitor
+ProtectHome=yes
+ReadWritePaths=/srv/runtime/apps/fstec-monitor/data
+UMask=0077
+
+[Install]
+WantedBy=default.target

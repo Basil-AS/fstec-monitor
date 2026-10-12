@@ -7,13 +7,14 @@ from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
+from aiogram.exceptions import TelegramRetryAfter
 from sqlalchemy import select
 
 from .config import settings
 from .crawler import category_key
+from .event_policy import CHANGE_EVENT_KINDS, OPERATIONAL_ERROR_KINDS
 from .models import BotSetting, Document, Event, EventDelivery, UserAccess, UserIgnoredCategory
-from .telegram_bot import api_url
+from .telegram.client import TelegramAPI, get_telegram_api
 
 log = logging.getLogger(__name__)
 TELEGRAM_TEXT_LIMIT = 4096
@@ -178,17 +179,8 @@ def _format_change_digest_parts(
     )
 
 
-MEANINGFUL_KINDS = {
-    "document_added",
-    "document_removed",
-    "document_restored",
-    "html_content_changed",
-    "attachment_added",
-    "attachment_removed",
-    "attachment_content_changed",
-    "attachment_binary_changed",
-}
-ERROR_KINDS = {"fetch_error", "storage_error"}
+MEANINGFUL_KINDS = CHANGE_EVENT_KINDS
+ERROR_KINDS = OPERATIONAL_ERROR_KINDS
 
 
 def should_notify_event(e: Event) -> bool:
@@ -233,6 +225,40 @@ def split_new_errors(events: list[Event], previously_notified: list[Event]) -> t
             unique.append(event)
     return unique, duplicates
 
+async def _send_digest(client: TelegramAPI, chat_id: int, message: str) -> bool:
+    """Send a digest via the process-shared aiogram Bot API transport."""
+    fallback = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "link_preview_options": {"is_disabled": True},
+    }
+    attempts = max(1, min(settings.max_retries, 3))
+    for attempt in range(attempts):
+        try:
+            if settings.telegram_rich_messages_enabled:
+                await client.call_rich(
+                    "sendRichMessage",
+                    {"chat_id": chat_id, "rich_message": {"html": message}},
+                    fallback,
+                    fallback_method="sendMessage",
+                )
+            else:
+                await client.call("sendMessage", fallback)
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt + 1 >= attempts:
+                log.warning("notification digest rate limited chat=%s", chat_id)
+                return False
+            await asyncio.sleep(min(60, max(1, exc.retry_after)))
+        except (OSError, RuntimeError, ValueError) as exc:
+            # A network error can arrive after Telegram accepted the message.
+            # Do not retry an ambiguous send; EventDelivery makes later passes safe.
+            log.warning("notification digest failed chat=%s error_type=%s", chat_id, type(exc).__name__)
+            return False
+    return False
+
+
 
 def _notification_recipients(session) -> set[int]:
     """Resolve configured and approved recipients once per delivery pass."""
@@ -244,7 +270,12 @@ def _notification_recipients(session) -> set[int]:
             log.warning("invalid FSTEC_TELEGRAM_CHAT_ID; skipping configured chat")
     recipients.update(
         user.chat_id
-        for user in session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
+        for user in session.scalars(
+            select(UserAccess).where(
+                UserAccess.status == "approved",
+                UserAccess.chat_id == UserAccess.user_id,
+            )
+        ).all()
     )
     recipients.discard(None)
     return recipients
@@ -288,7 +319,12 @@ def _notification_context(session, candidate_events: list[Event]):
             )
         ).all()
     }
-    approved_users = session.scalars(select(UserAccess).where(UserAccess.status == "approved")).all()
+    approved_users = session.scalars(
+        select(UserAccess).where(
+            UserAccess.status == "approved",
+            UserAccess.chat_id == UserAccess.user_id,
+        )
+    ).all()
     user_by_chat = {user.chat_id: user.user_id for user in approved_users}
     ignored_by_user: dict[int, set[str]] = {}
     if user_by_chat:
@@ -318,7 +354,7 @@ async def _deliver_to_recipients(
     globally_ignored: set[str],
 ) -> int:
     sent = 0
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+    async with get_telegram_api() as client:
         for chat_id in sorted(recipients):
             delivered = set(session.scalars(
                 select(EventDelivery.event_id).where(EventDelivery.chat_id == chat_id)
@@ -347,19 +383,7 @@ async def _deliver_to_recipients(
                 if not message_events or not parts:
                     continue
                 for message, part_events in parts:
-                    try:
-                        await _post_notification(
-                            client,
-                            api_url(settings.telegram_api_root, settings.telegram_bot_token, "sendMessage"),
-                            {
-                                "chat_id": chat_id,
-                                "text": message,
-                                "parse_mode": "HTML",
-                                "link_preview_options": {"is_disabled": True},
-                            },
-                        )
-                    except (httpx.HTTPError, RuntimeError) as exc:
-                        log.warning("notification digest failed chat=%s: %s", chat_id, exc)
+                    if not await _send_digest(client, chat_id, message):
                         break
                     for event in part_events:
                         session.add(EventDelivery(event_id=event.id, chat_id=chat_id))
@@ -367,44 +391,6 @@ async def _deliver_to_recipients(
                     sent += 1
     return sent
 
-
-async def _post_notification(client: httpx.AsyncClient, url: str, payload: dict) -> None:
-    """Deliver one notification without duplicating an unknown send outcome.
-
-    A transport timeout can happen after Telegram accepted ``sendMessage``.
-    Retrying that request would create duplicate notifications, so only an
-    explicit retryable HTTP response is retried.
-    """
-    attempts = max(1, settings.max_retries)
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        response = None
-        retry = False
-        try:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok"):
-                raise RuntimeError(body.get("description", "Telegram API rejected notification"))
-            return
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            retry = exc.response is not None and exc.response.status_code in _TELEGRAM_RETRYABLE_STATUS_CODES
-        except (httpx.TimeoutException, httpx.TransportError, RuntimeError) as exc:
-            last_error = exc
-        finally:
-            close = getattr(response, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except (OSError, RuntimeError, httpx.HTTPError) as exc:
-                    log.debug("could not close notification response: %s", exc)
-        if retry and attempt + 1 < attempts:
-            await asyncio.sleep(min(60, 2**attempt))
-            continue
-        break
-    assert last_error is not None
-    raise last_error
 
 @_single_flight
 async def notify_pending(session) -> int:
@@ -420,14 +406,20 @@ async def notify_pending(session) -> int:
         return 0
 
     error_events, unique_events = _pending_event_batches(session, events)
-
     candidate_events = error_events + unique_events
     if not candidate_events:
         return 0
     documents, user_by_chat, ignored_by_user, globally_ignored = _notification_context(session, candidate_events)
     sent = await _deliver_to_recipients(
-        session, recipients, candidate_events, error_events, unique_events,
-        documents, user_by_chat, ignored_by_user, globally_ignored,
+        session,
+        recipients,
+        candidate_events,
+        error_events,
+        unique_events,
+        documents,
+        user_by_chat,
+        ignored_by_user,
+        globally_ignored,
     )
 
     for event in candidate_events:

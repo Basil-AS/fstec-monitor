@@ -7,7 +7,15 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import fstec_monitor.telegram_bot as telegram_bot_module
-from fstec_monitor.models import Base, Document, Event, Snapshot, UserAccess
+from fstec_monitor.models import (
+    Base,
+    Document,
+    Event,
+    EventDelivery,
+    Snapshot,
+    UserAccess,
+    UserAccessEvent,
+)
 from fstec_monitor.notify import (
     format_change_digest,
     format_event,
@@ -52,11 +60,21 @@ def test_non_admin_callback_actions_are_denied_by_default(action):
     assert bot._callback_access_allowed(action, "run", 42) is False
 
 
-@pytest.mark.parametrize("action", ["menu", "nav", "userignore"])
+@pytest.mark.parametrize("action", ["nav", "userignore"])
 def test_non_admin_callback_navigation_and_personal_filters_remain_allowed(action):
     bot = TelegramBot.__new__(TelegramBot)
 
     assert bot._callback_access_allowed(action, "value", 42) is True
+
+
+def test_non_admin_menu_callback_is_limited_to_user_screens():
+    bot = TelegramBot.__new__(TelegramBot)
+
+    assert bot._callback_access_allowed("menu", "main", 42)
+    assert bot._callback_access_allowed("menu", "changes", 42)
+    assert bot._callback_access_allowed("menu", "my-ignore", 42)
+    assert not bot._callback_access_allowed("menu", "users", 42)
+    assert not bot._callback_access_allowed("menu", "settings", 42)
 
 
 def test_update_envelope_routing_keeps_callback_and_message_paths_separate():
@@ -115,58 +133,30 @@ def test_back_callback_renders_previous_payload_context():
     })]
 
 
-def test_idempotent_telegram_api_call_retries_transient_timeout(monkeypatch):
+@pytest.mark.parametrize("method,payload", [
+    ("editMessageText", {"chat_id": 1, "message_id": 2, "text": "updated"}),
+    ("sendMessage", {"chat_id": 1, "text": "hello"}),
+])
+def test_aiogram_transport_does_not_retry_ambiguous_outcome(method, payload, monkeypatch):
     import asyncio
 
-    import httpx
-
     bot = TelegramBot.__new__(TelegramBot)
-    bot.token = "token"
     calls = []
 
-    class Client:
-        async def post(self, url, json):
-            calls.append((url, json))
-            if len(calls) == 1:
-                raise httpx.ReadTimeout("temporary Telegram timeout")
-            return httpx.Response(
-                200,
-                json={"ok": True, "result": True},
-                request=httpx.Request("POST", url),
-            )
+    class API:
+        async def call(self, method_name, request):
+            calls.append((method_name, request))
+            raise RuntimeError("Telegram transport outcome unknown")
 
-    bot.client = Client()
-    async def no_sleep(_delay):
-        return None
+        async def call_rich(self, method_name, rich, fallback, *, fallback_method=None):
+            calls.append((method_name, rich))
+            raise RuntimeError("Telegram transport outcome unknown")
 
-    monkeypatch.setattr(telegram_bot_module.asyncio, "sleep", no_sleep)
+    bot.api = API()
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_rich_messages_enabled", False)
 
-    assert asyncio.run(bot.call("editMessageText", {"chat_id": 1, "message_id": 2})) is True
-    assert len(calls) == 2
-
-
-def test_send_message_is_not_retried_after_transport_timeout(monkeypatch):
-    import asyncio
-
-    import httpx
-
-    bot = TelegramBot.__new__(TelegramBot)
-    bot.token = "token"
-    calls = []
-
-    class Client:
-        async def post(self, url, json):
-            calls.append((url, json))
-            raise httpx.ReadTimeout("unknown Telegram outcome")
-
-    bot.client = Client()
-    async def no_sleep(_delay):
-        return None
-
-    monkeypatch.setattr(telegram_bot_module.asyncio, "sleep", no_sleep)
-
-    with pytest.raises(httpx.ReadTimeout):
-        asyncio.run(bot.call("sendMessage", {"chat_id": 1, "text": "hello"}))
+    with pytest.raises(RuntimeError, match="outcome unknown"):
+        asyncio.run(bot.call(method, payload))
     assert len(calls) == 1
 
 
@@ -237,37 +227,32 @@ def test_long_send_attaches_keyboard_only_to_tail_fragment():
     assert calls[-1][1]["reply_markup"] == {"inline_keyboard": []}
 
 
-def test_callback_edits_origin_message_instead_of_sending_another():
+def test_callback_screen_action_reuses_origin_message_context(monkeypatch):
     import asyncio
 
     bot = TelegramBot.__new__(TelegramBot)
-    edited = []
-    sent = []
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
+    calls = []
 
     async def call(method, payload):
-        if method == "answerCallbackQuery":
-            return True
-        edited.append((method, payload))
+        calls.append((method, payload))
         return True
 
-    async def send(*args, **kwargs):
-        sent.append((args, kwargs))
+    async def render(chat_id, screen, **kwargs):
+        calls.append(("render", chat_id, screen, kwargs))
 
     bot.call = call
-    bot.send = send
-    bot.set_schedule_mode = lambda _mode: None
-    bot.notifications_enabled = lambda: True
+    bot._render_screen = render
+    message = {"message_id": 88, "chat": {"id": 151599744, "type": "private"}}
     asyncio.run(bot.handle_callback({
         "id": "callback-1",
         "from": {"id": 151599744},
-        "message": {"message_id": 88, "chat": {"id": 151599744}},
-        "data": "settings:set:disabled",
+        "message": message,
+        "data": "v1:screen:settings",
     }))
 
-    assert sent == []
-    assert edited[0][0] == "editMessageText"
-    assert edited[0][1]["chat_id"] == 151599744
-    assert edited[0][1]["message_id"] == 88
+    assert calls[0][0] == "answerCallbackQuery"
+    assert calls[1] == ("render", 151599744, "settings", {"source_message": message})
 
 
 def test_scan_progress_refresh_edits_one_saved_message():
@@ -357,16 +342,18 @@ def test_pending_access_request_does_not_spam_user_on_repeated_updates(tmp_db):
         sent.append((args, kwargs))
 
     bot.send = send
-    request = {"user_id": 42, "chat_id": 142, "username": "user", "display_name": "User"}
+    request = {"user_id": 42, "chat_id": 42, "username": "user", "display_name": "User"}
 
     asyncio.run(bot.request_access(**request))
     asyncio.run(bot.request_access(**request))
 
-    assert len(sent) == 2
-    assert sent[0][0][0] == telegram_bot_module.settings.telegram_admin_id
+    assert len(sent) == 2  # one admin alert and one initial user acknowledgement
+    assert [call[0][0] for call in sent].count(telegram_bot_module.settings.telegram_admin_id) == 1
     callback_data = sent[0][0][2]["inline_keyboard"][0][0]["callback_data"]
-    assert callback_data.startswith("v1:access:approve-")
-    assert sent[1][0][0] == 142
+    assert callback_data.startswith("v1:access:approve-42-pending-")
+    assert [call[0][0] for call in sent].count(42) == 1
+    with tmp_db() as session:
+        assert session.get(UserAccess, 42).attempt_count == 2
 
 
 def test_concurrent_pending_access_requests_notify_once(tmp_db):
@@ -380,7 +367,7 @@ def test_concurrent_pending_access_requests_notify_once(tmp_db):
         await asyncio.sleep(0)
 
     bot.send = send
-    request = {"user_id": 43, "chat_id": 143, "username": "racer", "display_name": "Racer"}
+    request = {"user_id": 43, "chat_id": 43, "username": "racer", "display_name": "Racer"}
 
     async def run():
         await asyncio.gather(bot.request_access(**request), bot.request_access(**request))
@@ -388,7 +375,9 @@ def test_concurrent_pending_access_requests_notify_once(tmp_db):
     asyncio.run(run())
 
     assert [call[0][0] for call in sent].count(telegram_bot_module.settings.telegram_admin_id) == 1
-    assert [call[0][0] for call in sent].count(143) == 1
+    assert [call[0][0] for call in sent].count(43) == 1
+    with tmp_db() as session:
+        assert session.get(UserAccess, 43).attempt_count == 2
 
 
 def test_only_configured_admin_is_authorized():
@@ -399,21 +388,25 @@ def test_only_configured_admin_is_authorized():
 def test_admin_menu_contains_only_expected_commands():
     commands = telegram_commands()
     assert [item["command"] for item in commands] == ["start", "status", "changes", "report", "errors", "clear_errors", "scan", "users", "ignore", "settings", "help"]
-    assert admin_keyboard()["keyboard"][0] == [{"text": "📊 Статус"}, {"text": "📰 Изменения"}]
-    assert admin_keyboard()["is_persistent"] is True
+    buttons = [button for row in admin_keyboard()["inline_keyboard"] for button in row]
+    assert {button["text"] for button in buttons} >= {"📊 Статус", "📰 Изменения", "⚙️ Настройки"}
+    assert all(button["callback_data"].startswith("v1:menu:") for button in buttons)
+    assert "keyboard" not in admin_keyboard()  # dashboard navigation is inline
 
 
 def test_admin_menu_exposes_settings_and_manual_scan():
-    labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
+    buttons = [button for row in admin_keyboard()["inline_keyboard"] for button in row]
+    labels = [button["text"] for button in buttons]
 
     assert "⚙️ Настройки" in labels
-    assert "🔍 Проверить сейчас" in labels
-    assert all(not label.startswith("/") for label in labels)
+    assert "🔍 Проверка" in labels
+    assert all(button["callback_data"].startswith("v1:menu:") for button in buttons)
 
 
-def test_start_command_renders_reusable_screen_instead_of_new_message():
+def test_start_command_renders_reusable_screen_instead_of_new_message(monkeypatch):
     import asyncio
 
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     bot = TelegramBot.__new__(TelegramBot)
     rendered = []
 
@@ -438,9 +431,11 @@ def test_start_command_renders_reusable_screen_instead_of_new_message():
 
 
 def test_user_menu_contains_only_read_only_actions():
-    labels = [button["text"] for row in user_keyboard()["keyboard"] for button in row]
+    buttons = [button for row in user_keyboard()["inline_keyboard"] for button in row]
+    labels = [button["text"] for button in buttons]
 
-    assert labels == ["📰 Последние изменения", "🚫 Мои категории", "ℹ️ Помощь"]
+    assert labels == ["📰 Изменения", "🚫 Мои категории"]
+    assert all(button["callback_data"].startswith("v1:menu:") for button in buttons)
     assert all(not label.startswith("/") for label in labels)
 
 
@@ -526,11 +521,14 @@ def test_non_admin_restricted_command_uses_temporary_feedback(monkeypatch):
     assert temporary and temporary[0][0][1].startswith("Доступно только")
 
 
-def test_admin_reply_keyboard_uses_the_same_command_labels_as_command_menu():
-    labels = [button["text"] for row in admin_keyboard()["keyboard"] for button in row]
+def test_admin_inline_dashboard_has_unique_role_scoped_menu_actions():
+    buttons = [button for row in admin_keyboard()["inline_keyboard"] for button in row]
+    labels = [button["text"] for button in buttons]
 
     assert len(labels) == len(set(labels))
-    assert set(labels) == set(telegram_bot_module.ADMIN_LABEL_COMMANDS)
+    assert all(button["callback_data"].startswith("v1:menu:") for button in buttons)
+    assert {"⚙️ Настройки", "👥 Пользователи", "🔍 Проверка"} <= set(labels)
+    assert "keyboard" not in admin_keyboard()
 
 
 def test_settings_keyboard_contains_all_schedule_modes():
@@ -586,29 +584,31 @@ def test_schedule_mode_is_persisted(monkeypatch):
     assert bot.get_schedule_mode() == "disabled"
 
 
-def test_settings_callback_changes_mode_and_confirms(monkeypatch):
+def test_settings_callback_changes_mode_and_renders_settings_screen(monkeypatch):
     bot = TelegramBot.__new__(TelegramBot)
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     bot.set_schedule_mode = lambda mode: setattr(bot, "selected_mode", mode)
-    bot.notifications_enabled = lambda: True
-    sent = []
-    async def send(*args):
-        sent.append(args)
+    renders = []
 
     async def call(*_args):
         return None
 
-    bot.send = send
+    async def render(*args, **kwargs):
+        renders.append((args, kwargs))
+
     bot.call = call
+    bot._render_screen = render
 
     import asyncio
     asyncio.run(bot.handle_callback({
         "id": "callback-1",
         "from": {"id": 151599744},
-        "data": "settings:set:disabled",
+        "message": {"message_id": 88, "chat": {"id": 151599744, "type": "private"}},
+        "data": "v1:settings:set-disabled",
     }))
 
     assert bot.selected_mode == "disabled"
-    assert any("Расписание изменено" in args[1] for args in sent)
+    assert renders == [((151599744, "settings"), {"reset": True})]
 
 
 def test_legacy_settings_callback_adapter_handles_toggle():
@@ -670,6 +670,7 @@ def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     import asyncio
 
     bot = TelegramBot.__new__(TelegramBot)
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     bot.notifications_enabled = lambda: True
     bot.set_notifications_enabled = lambda enabled: setattr(bot, "saved_enabled", enabled)
     calls = []
@@ -688,7 +689,7 @@ def test_v1_settings_toggle_answers_callback_and_only_rerenders(monkeypatch):
     asyncio.run(bot.handle_callback({
         "id": "callback-settings",
         "from": {"id": 151599744},
-        "message": {"message_id": 42, "chat": {"id": 151599744}},
+        "message": {"message_id": 42, "chat": {"id": 151599744, "type": "private"}},
         "data": "v1:settings:notifications",
     }))
 
@@ -793,33 +794,44 @@ def test_stale_callback_is_acknowledged_but_does_not_dispatch():
     })
 
 
-def test_run_does_not_start_scan_immediately(monkeypatch):
-    class StopRun(Exception):
-        pass
+def test_dispatcher_polling_is_single_sequential_loop_and_does_not_start_scan(monkeypatch):
+    import asyncio
 
-    bot = TelegramBot.__new__(TelegramBot)
-    bot.offset = None
+    calls = []
     started = []
-    bot.configure_menu = lambda: None
-    bot.get_schedule_mode = lambda: "daily_noon"
-    bot.start_scan = lambda: started.append(True)
 
-    async def configure_menu():
+    class Watchdog:
+        async def start(self):
+            calls.append("watchdog-start")
+
+        async def stop(self):
+            calls.append("watchdog-stop")
+
+    class Dispatcher:
+        async def start_polling(self, _bot, **kwargs):
+            calls.append(("poll", kwargs))
+
+    async def no_op():
         return None
 
-    async def call(method, _payload):
-        if method == "getUpdates":
-            raise StopRun
-        return {}
-
-    bot.configure_menu = configure_menu
-    bot.call = call
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.bot = SimpleNamespace(get_me=no_op)
+    bot.watchdog = Watchdog()
+    bot.configure_menu = no_op
+    bot.create_dispatcher = lambda: Dispatcher()
+    bot._run_scheduler = no_op
+    bot.start_scan = lambda: started.append(True)
     monkeypatch.setattr(telegram_bot_module, "init_db", lambda: None)
+    monkeypatch.setattr(telegram_bot_module, "next_scheduled_at", lambda *_args: None)
 
-    with pytest.raises(StopRun):
-        import asyncio
-        asyncio.run(bot.run())
+    asyncio.run(bot.run())
 
+    assert calls[0] == "watchdog-start"
+    polling = calls[1][1]
+    assert polling["handle_as_tasks"] is False
+    assert polling["polling_timeout"] == 25
+    assert polling["allowed_updates"] == ["message", "callback_query"]
+    assert calls[-1] == "watchdog-stop"
     assert started == []
 
 
@@ -935,43 +947,43 @@ def test_completed_background_scan_task_is_consumed_and_cleared():
     asyncio.run(run())
 
 
-def test_getupdates_timeout_does_not_alert_admin(monkeypatch):
+def test_dispatcher_polling_failure_is_not_misreported_as_command_error(monkeypatch):
     import asyncio
 
     import httpx
 
-    class StopRun(Exception):
-        pass
-
-    bot = TelegramBot.__new__(TelegramBot)
-    bot.offset = None
-    bot.get_schedule_mode = lambda: "disabled"
-    bot.start_scan = lambda *_args: None
     alerts = []
 
-    async def configure_menu():
+    class Watchdog:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    class Dispatcher:
+        async def start_polling(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("long polling timeout")
+
+    async def no_op():
         return None
 
-    async def report_error(context, exc):
+    async def report_error(context, _exc, **_kwargs):
         alerts.append(context)
 
-    calls = []
-
-    async def call(method, _payload):
-        calls.append(method)
-        if len(calls) == 1:
-            raise httpx.ReadTimeout("slow poll")
-        raise StopRun
-
-    bot.configure_menu = configure_menu
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.bot = SimpleNamespace(get_me=no_op)
+    bot.watchdog = Watchdog()
+    bot.configure_menu = no_op
+    bot.create_dispatcher = lambda: Dispatcher()
+    bot._run_scheduler = no_op
     bot.report_error = report_error
-    bot.call = call
     monkeypatch.setattr(telegram_bot_module, "init_db", lambda: None)
+    monkeypatch.setattr(telegram_bot_module, "next_scheduled_at", lambda *_args: None)
 
-    with pytest.raises(StopRun):
+    with pytest.raises(httpx.ReadTimeout):
         asyncio.run(bot.run())
 
-    assert calls == ["getUpdates", "getUpdates"]
     assert alerts == []
 
 
@@ -1190,16 +1202,20 @@ def test_user_ignore_toggle_is_private_to_that_user(tmp_db):
     assert any(f"v1:userignore:{token}" == button["callback_data"] for row in markup["inline_keyboard"] for button in row)
 
 
-def test_admin_user_actions_use_versioned_callback_protocol(tmp_db):
+def test_admin_user_actions_use_nonce_bound_versioned_callback_protocol(tmp_db):
     with tmp_db() as session:
-        session.add(UserAccess(user_id=42, chat_id=42, status="pending"))
+        session.add(UserAccess(user_id=42, chat_id=42, status="pending", request_nonce="abcdef123456"))
         session.commit()
 
     bot = TelegramBot.__new__(TelegramBot)
     _, markup = bot.users_text()
 
     callbacks = [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
-    assert callbacks == ["v1:access:approve-42", "v1:access:deny-42"]
+    assert callbacks == [
+        "v1:access:approve-42-pending-abcdef123456",
+        "v1:access:deny-42-pending-abcdef123456",
+        "v1:access:block-42-pending-abcdef123456",
+    ]
 
 
 def test_admin_user_requests_are_paginated(tmp_db):
@@ -1375,7 +1391,8 @@ def test_missing_report_versions_use_temporary_feedback(monkeypatch):
     assert temporary and "файл отсутствует" in temporary[0][0][1]
 
 
-def test_report_without_id_uses_latest_meaningful_change(tmp_db):
+def test_report_without_id_uses_latest_meaningful_change(tmp_db, monkeypatch):
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     with tmp_db() as session:
         event = Event(
             kind="attachment_content_changed",
@@ -1425,9 +1442,10 @@ def test_report_without_history_uses_temporary_feedback(monkeypatch):
     assert temporary and "Изменений для отчёта пока нет" in temporary[0][0][1]
 
 
-def test_scan_requires_confirmation_and_callback_starts_it():
+def test_scan_requires_confirmation_and_callback_starts_it(monkeypatch):
     import asyncio
 
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     bot = TelegramBot.__new__(TelegramBot)
     bot.scan_task = None
     started = []
@@ -1458,33 +1476,35 @@ def test_scan_requires_confirmation_and_callback_starts_it():
     assert "запущена" in sent[-1][0].lower()
 
 
-def test_scan_control_callbacks_show_progress_and_confirm_stop():
+def test_scan_control_callbacks_show_progress_and_confirm_stop(monkeypatch):
     import asyncio
 
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 151599744)
     bot = TelegramBot.__new__(TelegramBot)
     bot.scan_task = SimpleNamespace(done=lambda: False)
     bot.scan_progress = ScanProgress(state="running", stage="Проверка документов", completed=1, total=2)
     bot.stop_scan = lambda: True
-    sent = []
+    calls = []
 
-    async def send(_chat_id, text, markup=None):
-        sent.append((text, markup))
-
-    async def call(*_args, **_kwargs):
+    async def call(method, payload):
+        calls.append((method, payload))
         return {}
 
-    bot.send = send
     bot.call = call
-    asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "data": "scan:status"}))
-    assert "1/2" in sent[-1][0]
-    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:stop"
+    private_message = {"message_id": 7, "chat": {"id": 151599744, "type": "private"}}
+    asyncio.run(bot.handle_callback({"id": "c1", "from": {"id": 151599744}, "message": private_message, "data": "scan:status"}))
+    edit = [payload for method, payload in calls if method == "editMessageText"][-1]
+    assert "1/2" in edit["text"]
+    assert edit["reply_markup"]["inline_keyboard"][1][0]["callback_data"] == "v1:scan:stop"
 
-    asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "data": "scan:stop"}))
-    assert "Остановить" in sent[-1][0]
-    assert sent[-1][1]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:stop-confirm"
+    asyncio.run(bot.handle_callback({"id": "c2", "from": {"id": 151599744}, "message": private_message, "data": "scan:stop"}))
+    edit = [payload for method, payload in calls if method == "editMessageText"][-1]
+    assert "Остановить" in edit["text"]
+    assert edit["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "v1:scan:stop-confirm"
 
-    asyncio.run(bot.handle_callback({"id": "c3", "from": {"id": 151599744}, "data": "scan:stop:confirm"}))
-    assert "остановка" in sent[-1][0].lower()
+    asyncio.run(bot.handle_callback({"id": "c3", "from": {"id": 151599744}, "message": private_message, "data": "scan:stop:confirm"}))
+    edit = [payload for method, payload in calls if method == "editMessageText"][-1]
+    assert "остановка" in edit["text"].lower()
 
 
 def test_fmt_duration():
@@ -1514,3 +1534,308 @@ def test_status_text_shows_scan_duration(tmp_db):
 
     assert "Длительность последней проверки: 2 мин 05 с" in text
     assert "Средняя длительность (1 зап.)" in text
+
+
+def test_dashboard_builders_dispatch_to_role_scoped_screens(tmp_db, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 99)
+    with tmp_db() as session:
+        session.add(UserAccess(user_id=42, chat_id=42, status="approved"))
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    calls = []
+
+    async def call(method, payload):
+        calls.append((method, payload))
+        return True
+
+    async def render(chat_id, screen, **kwargs):
+        calls.append(("render", chat_id, screen, kwargs))
+
+    bot.call = call
+    bot._render_screen = render
+
+    async def dispatch_keyboard(sender_id, keyboard):
+        for row in keyboard["inline_keyboard"]:
+            for button in row:
+                await bot.handle_callback({
+                    "id": f"{sender_id}-{button['callback_data']}",
+                    "from": {"id": sender_id},
+                    "message": {
+                        "message_id": 7,
+                        "chat": {"id": sender_id, "type": "private"},
+                    },
+                    "data": button["callback_data"],
+                })
+
+    asyncio.run(dispatch_keyboard(99, admin_keyboard()))
+    admin_routes = [call[2] for call in calls if call[0] == "render"]
+    assert admin_routes == ["status", "changes", "scan", "errors", "users", "filters", "settings"]
+
+    calls.clear()
+    asyncio.run(dispatch_keyboard(42, user_keyboard()))
+    user_routes = [call[2] for call in calls if call[0] == "render"]
+    assert user_routes == ["changes", "my_ignore"]
+
+    calls.clear()
+    asyncio.run(bot.handle_callback({
+        "id": "forged-admin-screen",
+        "from": {"id": 42},
+        "message": {"message_id": 8, "chat": {"id": 42, "type": "private"}},
+        "data": "v1:menu:users",
+    }))
+    assert not [call for call in calls if call[0] == "render"]
+
+
+def test_scheduler_recovers_from_transient_db_error_and_starts_due_scan(monkeypatch):
+    import asyncio
+    from datetime import datetime, timedelta
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.schedule_mode = None
+    bot.next_scan_at = None
+    modes = iter([RuntimeError("temporary DB failure"), "daily"])
+    errors = []
+    scans = []
+    sleep_count = 0
+
+    def get_schedule_mode():
+        value = next(modes)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def report_error(context, exc):
+        errors.append((context, type(exc)))
+
+    def start_scan(trigger):
+        scans.append(trigger)
+        return True
+
+    async def sleep(_seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(telegram_bot_module, "next_scheduled_at", lambda *_args: datetime.now().astimezone() - timedelta(seconds=1))
+    monkeypatch.setattr(telegram_bot_module.asyncio, "sleep", sleep)
+    bot.get_schedule_mode = get_schedule_mode
+    bot.report_error = report_error
+    bot.start_scan = start_scan
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(bot._run_scheduler())
+
+    assert errors == [("ошибка планировщика", RuntimeError)]
+    assert scans == ["auto"]
+
+
+def test_bot_dashboard_history_and_digest_share_canonical_event_policy(tmp_db):
+    from fstec_monitor.event_policy import CHANGE_EVENT_KINDS, OPERATIONAL_ERROR_KINDS
+
+    assert telegram_bot_module.MEANINGFUL_KINDS is CHANGE_EVENT_KINDS
+    assert set(telegram_bot_module.ERROR_KINDS) == OPERATIONAL_ERROR_KINDS
+
+    with tmp_db() as session:
+        document = Document(canonical_url="https://example.test/doc", title="Doc")
+        session.add(document)
+        session.flush()
+        session.add_all([
+            Event(
+                document_id=document.id,
+                kind="attachment_review_required",
+                severity="warning",
+                summary="review this attachment",
+                details="original attachment",
+                notified=False,
+            ),
+            Event(
+                document_id=document.id,
+                kind="attachment_binary_changed",
+                severity="info",
+                summary="binary-only noise",
+                details="raw binary differs",
+                notified=False,
+            ),
+        ])
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    stats = bot._status_stats()
+    history = bot.changes_text()
+    review = Event(kind="attachment_review_required", severity="warning", summary="manual review", details="")
+    binary = Event(kind="attachment_binary_changed", severity="info", summary="binary", details="")
+
+    assert stats["pending"] == 1
+    assert "review this attachment" in history
+    assert "binary-only noise" not in history
+    assert should_notify_event(review)
+    assert not should_notify_event(binary)
+
+
+def test_context_keyboard_panel_alias_returns_role_dashboard(tmp_db, monkeypatch):
+    import asyncio
+
+    from fstec_monitor.telegram.keyboards import context_keyboard
+
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 99)
+    with tmp_db() as session:
+        session.add_all([
+            UserAccess(user_id=42, chat_id=42, status="approved"),
+            UserAccess(user_id=43, chat_id=43, status="pending"),
+        ])
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    rendered = []
+
+    async def call(_method, _payload):
+        return True
+
+    async def render(chat_id, screen, **kwargs):
+        rendered.append((chat_id, screen, kwargs))
+
+    bot.call = call
+    bot._render_screen = render
+    back = context_keyboard()["inline_keyboard"][-1][0]
+    assert back["callback_data"] == "v1:menu:panel"
+
+    def callback(sender_id):
+        return {
+            "id": f"panel-{sender_id}",
+            "from": {"id": sender_id},
+            "message": {"message_id": 7, "chat": {"id": sender_id, "type": "private"}},
+            "data": back["callback_data"],
+        }
+
+    asyncio.run(bot.handle_callback(callback(99)))
+    assert rendered[-1][0:2] == (99, "main")
+    assert rendered[-1][2]["reset"] is True
+
+    asyncio.run(bot.handle_callback(callback(42)))
+    assert rendered[-1][0:2] == (42, "main")
+    assert rendered[-1][2]["reset"] is True
+
+    before = len(rendered)
+    asyncio.run(bot.handle_callback(callback(43)))
+    assert len(rendered) == before
+
+
+def test_user_pagination_callbacks_dispatch_only_for_approved_users(tmp_db, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(telegram_bot_module.settings, "telegram_admin_id", 99)
+    with tmp_db() as session:
+        session.add_all([
+            UserAccess(user_id=42, chat_id=42, status="approved"),
+            UserAccess(user_id=43, chat_id=43, status="pending"),
+        ])
+        for index in range(6):
+            document = Document(
+                canonical_url=f"https://example.test/change/{index}",
+                title=f"Document {index}",
+                category=f"Category {index}",
+            )
+            session.add(document)
+            session.flush()
+            session.add(Event(
+                document_id=document.id,
+                kind="document_added",
+                severity="warning",
+                summary=f"Added {index}",
+            ))
+        for index in range(9):
+            session.add(Document(
+                canonical_url=f"https://example.test/filter/{index}",
+                title=f"Filter {index}",
+                category=f"Personal category {index}",
+            ))
+        session.commit()
+
+    bot = TelegramBot.__new__(TelegramBot)
+    bot.navigation = {}
+    rendered = []
+
+    async def call(_method, _payload):
+        return True
+
+    async def render(chat_id, screen, **kwargs):
+        rendered.append((chat_id, screen, kwargs))
+
+    bot.call = call
+    bot._render_screen = render
+    _text, change_markup = bot.changes_page(0)
+    _text, ignore_markup = bot.user_ignore_text(42, 0)
+    callbacks = [
+        change_markup[0][2]["callback_data"],
+        ignore_markup["inline_keyboard"][-1][2]["callback_data"],
+    ]
+    assert callbacks == ["v1:screen:changes-page-1", "v1:screen:my-ignore-page-1"]
+
+    async def dispatch(sender_id, data):
+        await bot.handle_callback({
+            "id": f"{sender_id}-{data}",
+            "from": {"id": sender_id},
+            "message": {
+                "message_id": 7,
+                "chat": {"id": sender_id, "type": "private"},
+            },
+            "data": data,
+        })
+
+    for data, screen in zip(callbacks, ("changes", "my_ignore")):
+        before = len(rendered)
+        awaitable = dispatch(42, data)
+        asyncio.run(awaitable)
+        assert rendered[before][0:2] == (42, screen)
+        assert rendered[before][2]["payload"] == {"page": 1}
+
+        before = len(rendered)
+        asyncio.run(dispatch(43, data))
+        assert len(rendered) == before
+
+    for data in ("v1:screen:users-page-1", "v1:screen:filters-page-1", "v1:screen:errors-page-1"):
+        assert not bot._callback_access_allowed("screen", data.removeprefix("v1:screen:"), 42)
+
+
+def test_clear_errors_removes_only_matching_deliveries_with_foreign_keys_enabled(tmp_path, monkeypatch):
+    from sqlalchemy import event as sqlalchemy_event
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fk-errors.db'}")
+
+    @sqlalchemy_event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(telegram_bot_module, "SessionLocal", session_factory)
+    with session_factory() as session:
+        error = Event(kind="fetch_error", severity="warning", summary="failed fetch")
+        change = Event(kind="document_added", severity="warning", summary="new document")
+        user = UserAccess(user_id=42, chat_id=42, status="approved")
+        session.add_all([error, change, user])
+        session.flush()
+        session.add_all([
+            EventDelivery(event_id=error.id, chat_id=42),
+            EventDelivery(event_id=change.id, chat_id=42),
+        ])
+        session.add(UserAccessEvent(user_id=42, action="approved", new_status="approved", actor_id=99))
+        session.commit()
+        error_id, change_id = error.id, change.id
+
+    bot = TelegramBot.__new__(TelegramBot)
+    assert bot.clear_errors() == 1
+
+    with session_factory() as session:
+        assert session.get(Event, error_id) is None
+        assert session.get(Event, change_id) is not None
+        deliveries = session.scalars(select(EventDelivery).order_by(EventDelivery.event_id)).all()
+        assert [(delivery.event_id, delivery.chat_id) for delivery in deliveries] == [(change_id, 42)]
+        assert len(session.scalars(select(UserAccessEvent)).all()) == 1
+    engine.dispose()
