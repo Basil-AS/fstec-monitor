@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -100,7 +101,34 @@ class UserAccess(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    request_nonce: Mapped[str] = mapped_column(String(16), default="")
     notification_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class UserAccessEvent(Base):
+    __tablename__ = "user_access_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user_access.user_id", ondelete="RESTRICT"), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    old_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    new_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    username: Mapped[str] = mapped_column(Text, default="")
+    display_name: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[str] = mapped_column(Text, default="")
+
+
+def _reject_access_event_mutation(*_args) -> None:
+    raise ValueError("user access audit events are append-only")
+
+
+sqlalchemy_event.listen(UserAccessEvent, "before_update", _reject_access_event_mutation)
+sqlalchemy_event.listen(UserAccessEvent, "before_delete", _reject_access_event_mutation)
 
 
 class UserIgnoredCategory(Base):

@@ -13,6 +13,8 @@ authors = [{name = "Basil-AS"}]
 dependencies = [
   "beautifulsoup4>=4.12",
   "httpx>=0.27",
+  "aiogram @ git+https://github.com/aiogram/aiogram.git@0a8fb78f4ab71c917b58d3a671b54e2cfb7dba4c",
+  "pydantic>=2.5",
   "lxml>=5.2",
   "pydantic-settings>=2.3",
   "sqlalchemy>=2.0",
@@ -27,6 +29,7 @@ dev = ["pytest>=8.2", "ruff>=0.5"]
 
 [project.scripts]
 fstec-monitor = "fstec_monitor.cli:app"
+fstec-monitor-bot = "fstec_monitor.telegram_bot:run_bot"
 
 [tool.setuptools.packages.find]
 where = ["src"]

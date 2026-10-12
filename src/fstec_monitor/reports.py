@@ -11,6 +11,10 @@ def fmt_dt(value: datetime | None) -> str:
 
 
 def event_report(event: Event, title: str = "Документ", url: str = "") -> str:
+    details = event.details or "нет подробностей"
+    is_diff = details.lstrip().startswith(("--- ", "@@"))
+    is_semantic_diff = event.kind in {"html_content_changed", "attachment_content_changed"} and is_diff
+    details_heading = "Семантический diff:" if is_semantic_diff else "Подробности:" if not is_diff else "Подробности / old-new diff:"
     return "\n".join(
         (
             "Отчёт об изменении ФСТЭК Monitor",
@@ -24,8 +28,8 @@ def event_report(event: Event, title: str = "Документ", url: str = "") -
             "Кратко:",
             event.summary,
             "",
-            "Подробности / old-new diff:",
-            event.details or "нет подробностей",
+            details_heading,
+            details,
             "",
         )
     )
@@ -34,6 +38,14 @@ def event_report(event: Event, title: str = "Документ", url: str = "") -
 def event_report_md(event: Event, title: str = "Документ", url: str = "") -> str:
     details = event.details or "нет подробностей"
     is_diff = details.lstrip().startswith(("--- ", "@@"))
+    is_semantic_diff = event.kind in {"html_content_changed", "attachment_content_changed"} and is_diff
+    section = (
+        "## Семантический diff"
+        if is_semantic_diff
+        else "## До / после (unified diff)"
+        if is_diff
+        else "## Подробности"
+    )
     body = f"```diff\n{details}\n```" if is_diff else details
     return "\n".join(
         (
@@ -49,7 +61,7 @@ def event_report_md(event: Event, title: str = "Документ", url: str = ""
             "",
             event.summary,
             "",
-            "## До / после (unified diff)",
+            section,
             "",
             body,
             "",

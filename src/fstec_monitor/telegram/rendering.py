@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 from html import escape
 
 
@@ -34,4 +36,24 @@ def render_scan_progress(progress) -> str:
 def render_error_notice(context: str, error_id: int | str | None = None) -> str:
     safe_context = str(context).strip()[:80] or "операция"
     suffix = f" · ID {error_id}" if isinstance(error_id, int) else ""
-    return f"⚠️ Не удалось выполнить: {safe_context}.{suffix}\nОшибка записана в журнал."
+    return f"⚠️ Не удалось выполнить: {html.escape(safe_context)}.{suffix}\nПодробности доступны в журнале сервера."
+
+
+def markdown_to_telegram_html(markdown: str) -> str:
+    """Render the small Markdown subset used by screens as safe Telegram HTML."""
+    rendered: list[str] = []
+    for line in markdown.splitlines():
+        if line.startswith("### "):
+            rendered.append(f"<b>{html.escape(line[4:])}</b>")
+        elif line.startswith("## "):
+            rendered.append(f"<b>{html.escape(line[3:])}</b>")
+        elif line.startswith("# "):
+            rendered.append(f"<b>{html.escape(line[2:])}</b>")
+        elif line.startswith(("- ", "* ")):
+            rendered.append("• " + html.escape(line[2:]))
+        else:
+            escaped = html.escape(line)
+            escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+            escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+            rendered.append(escaped)
+    return "\n".join(rendered)

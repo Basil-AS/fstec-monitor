@@ -9,19 +9,32 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
-from sqlalchemy import delete, func, select, update
+from aiogram import Dispatcher, Router
+from aiogram.types import CallbackQuery, Message
+from sqlalchemy import delete, func, select
 
-from .access import access_request_text, is_allowed
+from .access import (
+    ACCESS_TRANSITIONS,
+    access_request_text,
+    is_allowed,
+    new_request_nonce,
+    record_access_event,
+    resolve_access,
+    safe_identity,
+)
 from .config import settings
 from .db import SessionLocal, init_db
+from .event_policy import CHANGE_EVENT_KINDS, OPERATIONAL_ERROR_KINDS
 from .models import (
     Attachment,
     AttachmentVersion,
     BotSetting,
     Document,
     Event,
+    EventDelivery,
     ScanRun,
     Snapshot,
     UserAccess,
@@ -36,9 +49,11 @@ from .schedule import (
     schedule_label,
 )
 from .storage import ObjectStore, StorageQuotaExceeded
+from .systemd_notify import SystemdWatchdog
 from .telegram import keyboards as telegram_keyboards
 from .telegram.callbacks import decode_callback
 from .telegram.change_views import paginate_change_groups, visible_change_groups
+from .telegram.client import TelegramAPI, close_telegram_api, get_telegram_api
 from .telegram.lifecycle import MessageLifecycleManager, ProgressCoalescer
 from .telegram.list_views import paginate_lines, pagination_row
 from .telegram.navigation import NavigationStack, main_screen, screen_with_navigation
@@ -48,17 +63,21 @@ from .telegram.ux.messages import MessageLedger
 from .telegram.ux.models import ViewModel
 
 log = logging.getLogger(__name__)
-MEANINGFUL_KINDS = {
-    "document_added",
-    "document_removed",
-    "document_restored",
-    "html_content_changed",
-    "attachment_added",
-    "attachment_removed",
-    "attachment_content_changed",
-    "attachment_binary_changed",
+MEANINGFUL_KINDS = CHANGE_EVENT_KINDS
+ERROR_KINDS = tuple(sorted(OPERATIONAL_ERROR_KINDS))
+ACCESS_STATUS_LABELS = {
+    "pending": "ожидает",
+    "approved": "доступ разрешён",
+    "denied": "отказано",
+    "blocked": "заблокирован",
 }
-ERROR_KINDS = ("fetch_error", "storage_error")
+ACCESS_ACTION_LABELS = {
+    "approve": "✅ Разрешить",
+    "deny": "❌ Отказать",
+    "block": "⛔ Блокировать",
+    "unblock": "🔓 Разблокировать",
+    "revoke": "🚫 Отозвать доступ",
+}
 IGNORED_SETTING_KEY = "ignored_categories"
 QUOTA_CACHE_SECONDS = 300
 ADMIN_COMMANDS = (
@@ -89,7 +108,12 @@ USER_LABEL_COMMANDS = {
     "🚫 Мои категории": "/my_ignore",
     "ℹ️ Помощь": "/help",
 }
-USER_ALLOWED_COMMANDS = {"/start", "/help", "/changes", "/my_ignore"}
+USER_COMMANDS = (
+    ("start", "открыть меню"),
+    ("help", "справка"),
+    ("request_access", "повторно запросить доступ"),
+)
+USER_ALLOWED_COMMANDS = {"/start", "/help", "/changes", "/my_ignore", "/request_access"}
 _IDEMPOTENT_TELEGRAM_METHODS = frozenset({
     "answerCallbackQuery",
     "deleteMessage",
@@ -187,7 +211,12 @@ class TelegramBot:
         self._temporary_delete_tasks: set[asyncio.Task] = set()
         self.next_scan_at: datetime | None = None
         self.schedule_mode: str | None = None
-        self.client = httpx.AsyncClient(timeout=40)
+        self.api: TelegramAPI = get_telegram_api(self.token, settings.telegram_api_root)
+        self.bot = self.api.bot
+        self.dispatcher = Dispatcher()
+        self.router = Router()
+        self._register_aiogram_routes()
+        self.watchdog = SystemdWatchdog()
         self.lifecycle = MessageLifecycleManager(self)
         # UX toolkit façade: lifecycle remains the single source of truth.
         self.ux = MessageLedger(self.lifecycle)
@@ -196,6 +225,36 @@ class TelegramBot:
         self.navigation: dict[int, NavigationStack] = {}
         self.last_error_notice = 0.0
         self._quota_cache: tuple[float, tuple[int, int]] | None = None
+
+    def create_dispatcher(self) -> Dispatcher:
+        return self.dispatcher
+
+    async def _run_scheduler(self) -> None:
+        await self._scheduler_loop()
+
+    def _register_aiogram_routes(self) -> None:
+        @self.router.message()
+        async def message_adapter(message: Message) -> None:
+            if message.chat.type != "private" or message.from_user is None:
+                return
+            await self.handle_update_safely({
+                "update_id": 0,
+                "message": message.model_dump(mode="json", exclude_none=True),
+            })
+
+        @self.router.callback_query()
+        async def callback_adapter(callback: CallbackQuery) -> None:
+            if callback.from_user is None or callback.message is None:
+                return
+            if callback.message.chat.type != "private" or callback.from_user.id != callback.message.chat.id:
+                await callback.answer()
+                return
+            await self.handle_update_safely({
+                "update_id": 0,
+                "callback_query": callback.model_dump(mode="json", exclude_none=True),
+            })
+
+        self.dispatcher.include_router(self.router)
 
     async def close(self) -> None:
         for task in getattr(self, "_temporary_delete_tasks", set()):
@@ -206,32 +265,23 @@ class TelegramBot:
         lifecycle = getattr(self, "lifecycle", None)
         if lifecycle is not None:
             await lifecycle.close()
-        await self.client.aclose()
+        await close_telegram_api()
 
-    async def call(self, method: str, payload: dict) -> dict:
-        url = api_url(settings.telegram_api_root, self.token, method)
-        attempts = max(1, min(settings.max_retries, 3)) if method in _IDEMPOTENT_TELEGRAM_METHODS else 1
-        for attempt in range(attempts):
-            try:
-                response = await self.client.post(url, json=payload)
-                if response.status_code in _TELEGRAM_RETRYABLE_STATUS_CODES and attempt + 1 < attempts:
-                    retry_after = response.headers.get("retry-after")
-                    try:
-                        delay = min(30.0, max(0.0, float(retry_after))) if retry_after else 2.0 ** attempt
-                    except ValueError:
-                        delay = 2.0 ** attempt
-                    await asyncio.sleep(delay)
-                    continue
-                response.raise_for_status()
-                body = response.json()
-                if not body.get("ok"):
-                    raise RuntimeError(f"Telegram API error in {method}: {body.get('description', 'unknown')}")
-                return body.get("result", {})
-            except (httpx.TimeoutException, httpx.TransportError):
-                if attempt + 1 >= attempts:
-                    raise
-                await asyncio.sleep(min(30.0, 2.0 ** attempt))
-        raise RuntimeError(f"Telegram API call exhausted retries: {method}")
+    async def call(self, method: str, payload: dict) -> Any:
+        if method in {"sendMessage", "editMessageText"} and settings.telegram_rich_messages_enabled:
+            fallback = dict(payload)
+            rich = dict(payload)
+            text = rich.pop("text", "")
+            rich.pop("parse_mode", None)
+            rich["rich_message"] = {"html" if has_html_markup(text) else "markdown": text}
+            rich_method = "sendRichMessage" if method == "sendMessage" else "editMessageText"
+            return await self.api.call_rich(
+                rich_method,
+                rich,
+                fallback,
+                fallback_method=method,
+            )
+        return await self.api.call(method, payload)
 
     def _log_tgux(
         self,
@@ -336,6 +386,11 @@ class TelegramBot:
 
     async def configure_menu(self) -> None:
         await self.call("setMyCommands", {
+            "commands": [{"command": command, "description": description} for command, description in USER_COMMANDS],
+            "scope": {"type": "all_private_chats"},
+            "language_code": "ru",
+        })
+        await self.call("setMyCommands", {
             "commands": telegram_commands(),
             "scope": {"type": "chat", "chat_id": settings.telegram_admin_id},
             "language_code": "ru",
@@ -350,27 +405,8 @@ class TelegramBot:
 
     async def send_file(self, chat_id: int, name: str, data: bytes, caption: str = "") -> int | None:
         await self.send_chat_action(chat_id, "upload_document")
-        response = None
-        try:
-            response = await self.client.post(
-                api_url(settings.telegram_api_root, self.token, "sendDocument"),
-                timeout=settings.telegram_upload_timeout_seconds,
-                data={"chat_id": str(chat_id), "caption": caption[:900]},
-                files={"document": (name, data, "text/markdown" if name.endswith(".md") else "application/octet-stream")},
-            )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok"):
-                raise RuntimeError(f"Telegram API error in sendDocument: {body.get('description', 'unknown')}")
-        finally:
-            close = getattr(response, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except (OSError, RuntimeError, httpx.HTTPError) as exc:  # cleanup must not mask upload result
-                    log.debug("could not close Telegram upload response: %s", exc)
-        result = body.get("result") or {}
-        message_id = result.get("message_id") if isinstance(result, dict) else None
+        result = await self.api.send_document(chat_id, name, data, caption)
+        message_id = getattr(result, "message_id", None)
         payload = {"chat_id": chat_id}
         if message_id is not None:
             payload["message_id"] = message_id
@@ -758,24 +794,47 @@ class TelegramBot:
 
     def users_text(self, page: int = 0) -> tuple[str, dict | None]:
         with SessionLocal() as session:
-            users = session.scalars(select(UserAccess).where(UserAccess.status == "pending").order_by(UserAccess.requested_at)).all()
+            users = session.scalars(
+                select(UserAccess)
+                .where(UserAccess.user_id != settings.telegram_admin_id)
+                .order_by(UserAccess.requested_at)
+            ).all()
+            users.sort(key=lambda user: (user.status != "pending", user.requested_at, user.user_id))
+            rotated = False
+            for user in users:
+                if not user.request_nonce:
+                    user.request_nonce = new_request_nonce()
+                    record_access_event(
+                        session, user, "request_nonce_rotated", old_status=user.status,
+                        new_status=user.status, actor_id=settings.telegram_admin_id,
+                    )
+                    rotated = True
+            if rotated:
+                session.commit()
         if not users:
-            return "Новых заявок на доступ нет.", None
+            return "Пользователей и заявок пока нет.", None
         page_users, page, pages = paginate_lines(users, page, 5)
-        lines = [f"Заявки на доступ: {len(users)} · страница {page + 1}/{pages}"]
+        lines = [f"Пользователи: {len(users)} · страница {page + 1}/{pages}"]
         buttons = []
         for user in page_users:
-            identity = f"@{user.username}" if user.username else user.display_name or "без имени"
-            lines.append(f"{identity} — ID {user.user_id}")
+            safe_username = safe_identity(user.username, limit=32)
+            if safe_username and all(
+                char.isascii() and (char.isalnum() or char == "_") for char in safe_username
+            ):
+                identity = f"@{escape_html(safe_username)}"
+            else:
+                identity = escape_html(safe_identity(user.display_name)) or "без имени"
+            status_label = ACCESS_STATUS_LABELS.get(user.status, user.status)
+            lines.append(f"{identity} — ID {user.user_id} · статус: {status_label}")
+            actions = [action for action, transitions in ACCESS_TRANSITIONS.items() if user.status in transitions]
             buttons.append([
                 {
-                    "text": f"✅ {identity[:30]}",
-                    "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user.user_id}"),
-                },
-                {
-                    "text": "❌",
-                    "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user.user_id}"),
-                },
+                    "text": f"{ACCESS_ACTION_LABELS[action]} · #{user.user_id} · {status_label}",
+                    "callback_data": telegram_keyboards.encode_callback(
+                        "access", f"{action}-{user.user_id}-{user.status}-{user.request_nonce}"
+                    ),
+                }
+                for action in actions
             ])
         if pages > 1:
             buttons.append(pagination_row(
@@ -940,51 +999,132 @@ class TelegramBot:
 
     def clear_errors(self) -> int:
         with SessionLocal() as session:
+            error_event_ids = select(Event.id).where(Event.kind.in_(ERROR_KINDS))
+            session.execute(delete(EventDelivery).where(EventDelivery.event_id.in_(error_event_ids)))
             result = session.execute(delete(Event).where(Event.kind.in_(ERROR_KINDS)))
             session.commit()
             return result.rowcount or 0
 
-    async def request_access(self, user_id: int, chat_id: int, username: str, display_name: str) -> bool:
+    async def request_access(
+        self,
+        user_id: int,
+        chat_id: int,
+        username: str,
+        display_name: str,
+        *,
+        explicit: bool = False,
+    ) -> bool:
+        """Create/reopen an access request and record every state transition."""
         locks = getattr(self, "_access_request_locks", None)
         if locks is None:
             locks = self._access_request_locks = {}
         lock = locks.setdefault(user_id, asyncio.Lock())
         async with lock:
+            now = datetime.now(UTC)
             should_notify = False
+            respond_to_user = False
+            message = ""
             with SessionLocal() as session:
                 user = session.get(UserAccess, user_id)
-                if user and is_allowed(user):
-                    return True
-                if not user:
-                    user = UserAccess(user_id=user_id, chat_id=chat_id, username=username, display_name=display_name, status="pending")
+                if user is None:
+                    user = UserAccess(
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        username=username,
+                        display_name=display_name,
+                        status="pending",
+                        requested_at=now,
+                        last_attempt_at=now,
+                        request_nonce=new_request_nonce(),
+                    )
                     session.add(user)
+                    session.flush()
+                    record_access_event(
+                        session, user, "request_created", old_status=None,
+                        new_status="pending", actor_id=user_id,
+                    )
                     should_notify = True
-                elif user.status != "pending":
-                    user.status = "pending"
-                    user.chat_id = chat_id
-                    user.username = username
-                    user.display_name = display_name
-                    user.notification_sent = False
-                    should_notify = True
+                    respond_to_user = True
                 else:
+                    user.attempt_count = (user.attempt_count or 0) + 1
+                    user.last_attempt_at = now
                     user.chat_id = chat_id
-                    user.username = username
-                    user.display_name = display_name
-                    should_notify = not user.notification_sent
+                    user.username = username or user.username
+                    user.display_name = display_name or user.display_name
+                    if is_allowed(user):
+                        session.commit()
+                        if explicit:
+                            await self.send(chat_id, "✅ Доступ уже активен.", {"remove_keyboard": True})
+                        return True
+                    respond_to_user = explicit
+                    if user.status == "blocked":
+                        message = "⛔ Доступ заблокирован администратором."
+                    elif user.status == "denied" and not explicit:
+                        message = "❌ Доступ закрыт. Для повторного рассмотрения отправьте /request_access."
+                    elif user.status == "denied" and explicit:
+                        old_status = user.status
+                        user.status = "pending"
+                        user.requested_at = now
+                        user.reviewed_at = None
+                        user.resolved_by = None
+                        user.notification_sent = False
+                        user.request_nonce = new_request_nonce()
+                        record_access_event(
+                            session, user, "request_renewed", old_status=old_status,
+                            new_status="pending", actor_id=user_id,
+                        )
+                        should_notify = True
+                    elif user.status == "pending":
+                        if not user.request_nonce:
+                            user.request_nonce = new_request_nonce()
+                            user.notification_sent = False
+                            record_access_event(
+                                session, user, "request_nonce_rotated", old_status="pending",
+                                new_status="pending", actor_id=user_id,
+                            )
+                        should_notify = not user.notification_sent
+                        message = "Ваша заявка уже ожидает решения администратора."
+                    else:
+                        message = "Состояние доступа требует проверки администратором."
+                nonce = user.request_nonce
                 session.commit()
+
             if should_notify:
-                await self.send(settings.telegram_admin_id, access_request_text(user_id, username, display_name), {
-                    "inline_keyboard": [[
-                        {"text": "✅ Разрешить", "callback_data": telegram_keyboards.encode_callback("access", f"approve-{user_id}")},
-                        {"text": "❌ Отклонить", "callback_data": telegram_keyboards.encode_callback("access", f"deny-{user_id}")},
-                    ]]
-                })
+                await self.send(
+                    settings.telegram_admin_id,
+                    access_request_text(user_id, username, display_name),
+                    {"inline_keyboard": [[
+                        {
+                            "text": f"✅ Разрешить · #{user_id} · ожидает",
+                            "callback_data": telegram_keyboards.encode_callback(
+                                "access", f"approve-{user_id}-pending-{nonce}"
+                            ),
+                        },
+                        {
+                            "text": f"❌ Отказать · #{user_id} · ожидает",
+                            "callback_data": telegram_keyboards.encode_callback(
+                                "access", f"deny-{user_id}-pending-{nonce}"
+                            ),
+                        },
+                    ]]},
+                )
                 with SessionLocal() as session:
                     user = session.get(UserAccess, user_id)
-                    if user:
+                    if user and user.status == "pending" and user.request_nonce == nonce:
                         user.notification_sent = True
+                        record_access_event(
+                            session, user, "admin_notified", old_status="pending",
+                            new_status="pending", actor_id=settings.telegram_admin_id,
+                        )
                         session.commit()
-                await self.send(chat_id, "Заявка на доступ отправлена администратору. Ожидайте решения.")
+            if respond_to_user:
+                if not message:
+                    message = (
+                        "Заявка на доступ отправлена администратору. Ожидайте решения."
+                        if should_notify
+                        else "Ваша заявка уже ожидает решения администратора."
+                    )
+                await self.send(chat_id, message, {"remove_keyboard": True})
             return False
 
     def _navigation_stack(self, chat_id: int) -> NavigationStack:
@@ -1172,8 +1312,31 @@ class TelegramBot:
         reply,
     ) -> bool:
         """Handle namespaced navigation/scan/settings callbacks."""
-        if action == "menu" and value == "main":
-            await self._render_screen(chat_id or sender_id, "main", reset=True, source_message=message)
+        if action == "menu":
+            target = chat_id or sender_id
+            if value in {"main", "panel"}:
+                await self._render_screen(target, "main", reset=True, source_message=message)
+                return True
+            admin_screens = {
+                "status": "status",
+                "changes": "changes",
+                "scan": "scan",
+                "errors": "errors",
+                "users": "users",
+                "ignore": "filters",
+                "settings": "settings",
+            }
+            user_screens = {
+                "changes": "changes",
+                "my-ignore": "my_ignore",
+                "help": "help",
+            }
+            screen = (admin_screens if is_admin(sender_id, settings.telegram_admin_id) else user_screens).get(value)
+            if screen is None:
+                return True
+            stack = self._navigation_stack(target)
+            stack.push(screen)
+            await self._render_screen(target, screen, source_message=message, reason="menu")
             return True
         if action == "nav" and value == "back":
             stack = self._navigation_stack(chat_id or sender_id)
@@ -1288,9 +1451,15 @@ class TelegramBot:
         """
         if is_admin(sender_id, settings.telegram_admin_id):
             return True
-        if action in {"menu", "nav", "userignore"}:
+        if action == "menu":
+            return value in {"main", "panel", "changes", "my-ignore", "help"}
+        if action in {"nav", "userignore"}:
             return True
-        return action == "screen" and value in {"changes", "my_ignore", "help"}
+        if action != "screen":
+            return False
+        if value in {"changes", "my_ignore", "help"}:
+            return True
+        return bool(re.fullmatch(r"(?:changes|my-ignore)-page-\d+", value))
 
     def _callback_user_is_allowed(self, sender_id: int | None) -> bool:
         if not sender_id:
@@ -1298,44 +1467,47 @@ class TelegramBot:
         with SessionLocal() as session:
             return is_allowed(session.get(UserAccess, sender_id))
 
-    async def _handle_access_decision(self, value: str, reply) -> None:
-        """Settle an access request exactly once and close its action buttons."""
-        try:
-            decision, raw_user_id = value.split("-", 1)
-            user_id = int(raw_user_id)
-        except (ValueError, AttributeError):
-            await reply("Заявка устарела.", {"inline_keyboard": []})
+    async def _handle_access_decision(self, value: str, reply, *, actor_id: int | None) -> None:
+        """Settle a nonce-bound access request and append its audit event atomically."""
+        match = re.fullmatch(
+            r"(approve|deny|block|unblock|revoke)-(\d+)-(pending|approved|denied|blocked)-([0-9a-f]{12})",
+            value,
+        )
+        if not match or not is_admin(actor_id, settings.telegram_admin_id):
+            await reply("Заявка устарела или недоступна.", {"inline_keyboard": []})
             return
-        if decision not in {"approve", "deny"} or user_id <= 0:
-            await reply("Заявка устарела.", {"inline_keyboard": []})
-            return
-
-        status = "approved" if decision == "approve" else "denied"
+        decision, raw_user_id, expected_status, nonce = match.groups()
+        user_id = int(raw_user_id)
         target_chat = None
         with SessionLocal() as session:
             user = session.get(UserAccess, user_id)
-            if not user:
-                await reply("Заявка уже недоступна.", {"inline_keyboard": []})
+            if not user or user.status != expected_status:
+                await reply("Состояние заявки изменилось. Откройте список заново.", {"inline_keyboard": []})
                 return
-            result = session.execute(
-                update(UserAccess)
-                .where(UserAccess.user_id == user_id, UserAccess.status == "pending")
-                .values(status=status, reviewed_at=datetime.now(UTC))
+            status = resolve_access(
+                session,
+                user,
+                decision,
+                actor_id=actor_id,
+                admin_id=settings.telegram_admin_id,
+                expected_nonce=nonce,
             )
-            if result.rowcount != 1:
-                verdict = "разрешён" if user.status == "approved" else "отклонён"
-                await reply(f"Решение уже принято: доступ {verdict}.", {"inline_keyboard": []})
+            if status is None:
+                await reply("Решение устарело или переход доступа недопустим. Откройте /users заново.", {"inline_keyboard": []})
                 return
-            target_chat = user.chat_id
             session.commit()
+            if user.chat_id == user.user_id:
+                target_chat = user.chat_id
 
+        user_messages = {
+            "approved": "✅ Доступ разрешён. Используйте /help.",
+            "denied": "❌ Доступ не разрешён. При необходимости отправьте /request_access.",
+            "blocked": "⛔ Доступ заблокирован администратором.",
+        }
         if target_chat:
-            await self.send(
-                target_chat,
-                "✅ Доступ разрешён. Используйте /help." if status == "approved" else "❌ В доступе отказано.",
-            )
+            await self.send(target_chat, user_messages[status])
         await reply(
-            f"Пользователь {user_id}: {'доступ разрешён' if status == 'approved' else 'доступ отклонён'}.",
+            f"Пользователь {user_id}: {ACCESS_STATUS_LABELS[status]}.",
             {"inline_keyboard": []},
         )
 
@@ -1417,7 +1589,7 @@ class TelegramBot:
             return True
         return False
 
-    async def _dispatch_legacy_admin_callback(self, data: list[str], reply) -> bool:
+    async def _dispatch_legacy_admin_callback(self, data: list[str], reply, *, actor_id: int | None = None) -> bool:
         """Keep pre-v1 admin menu, filter, and access buttons working."""
         if data == ["menu", "main"]:
             await reply("Главное меню готово. Выберите действие:")
@@ -1427,7 +1599,7 @@ class TelegramBot:
             await reply(result or "Категория не найдена — возможно, список изменился. Откройте /ignore заново.")
             return True
         if len(data) == 3 and data[0] == "access" and data[1] in {"approve", "deny"} and data[2].isdigit():
-            await self._handle_access_decision(f"{data[1]}-{data[2]}", reply)
+            await self._handle_access_decision(f"{data[1]}-{data[2]}", reply, actor_id=actor_id)
             return True
         return False
 
@@ -1540,7 +1712,7 @@ class TelegramBot:
         if await self._dispatch_legacy_admin_callback(data, reply):
             return
         if len(data) == 3 and data[0] == "v1" and data[1] == "access":
-            await self._handle_access_decision(data[2], reply)
+            await self._handle_access_decision(data[2], reply, actor_id=sender_id)
             return
         return
 
@@ -1662,13 +1834,20 @@ class TelegramBot:
             lifecycle.remember_context_message(chat_id, message)
             await lifecycle.cleanup_trigger_message(chat_id, message)
         sender_id = sender.get("id")
-        if (not is_admin(sender_id, settings.telegram_admin_id)
-                and (not sender_id or not await self.request_access(sender_id, chat_id, sender.get("username", ""), " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))))):
-            return
-        parts = text.split()
         text = {**ADMIN_LABEL_COMMANDS, **USER_LABEL_COMMANDS}.get(text, text)
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
+        if not is_admin(sender_id, settings.telegram_admin_id) and (
+            not sender_id
+            or not await self.request_access(
+                sender_id,
+                chat_id,
+                sender.get("username", ""),
+                " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])),
+                explicit=command == "/request_access",
+            )
+        ):
+            return
         try:
             await self._dispatch_command(command, parts, chat_id, sender_id)
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
@@ -1702,39 +1881,67 @@ class TelegramBot:
             log.exception("failed to process Telegram update")
             await self.report_error("ошибка обработки update", exc)
 
+    async def _scheduler_loop(self) -> None:
+        retry_delay = 1
+        while True:
+            try:
+                current_mode = self.get_schedule_mode()
+                if current_mode != self.schedule_mode:
+                    self.schedule_mode = current_mode
+                    self.next_scan_at = next_scheduled_at(current_mode, datetime.now().astimezone())
+                now = datetime.now().astimezone()
+                if self.next_scan_at is not None and now >= self.next_scan_at:
+                    self.start_scan("auto")
+                    self.next_scan_at = next_scheduled_at(current_mode, now + timedelta(seconds=1))
+                retry_delay = 1
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — isolate transient scheduler/DB errors
+                log.warning("scheduled scan iteration failed (%s); retrying in %ss", type(exc).__name__, retry_delay)
+                try:
+                    await self.report_error("ошибка планировщика", exc)
+                except Exception as report_exc:  # noqa: BLE001 — reporting must not kill scheduler recovery
+                    log.warning("scheduler error notification failed (%s)", type(report_exc).__name__)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+
     async def run(self) -> None:
         init_db()
+        try:
+            await self.bot.get_me()
+        except Exception as exc:  # noqa: BLE001 — readiness must fail closed for API/decode errors
+            detail = str(exc)[:160]
+            token = getattr(self, "token", None)
+            if token:
+                detail = detail.replace(token, "[REDACTED]")
+            raise RuntimeError(f"Telegram Bot API readiness check failed: {detail or type(exc).__name__}") from None
         try:
             await self.configure_menu()
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             await self.report_error("не удалось настроить меню Telegram", exc, notify_admin=False)
-        self.schedule_mode = self.get_schedule_mode()
-        self.next_scan_at = next_scheduled_at(self.schedule_mode, datetime.now().astimezone())
-        while True:
-            current_mode = self.get_schedule_mode()
-            if current_mode != self.schedule_mode:
-                self.schedule_mode = current_mode
-                self.next_scan_at = next_scheduled_at(current_mode, datetime.now().astimezone())
-            now = datetime.now().astimezone()
-            if self.next_scan_at is not None and now >= self.next_scan_at:
-                self.start_scan("auto")
-                self.next_scan_at = next_scheduled_at(current_mode, now + timedelta(seconds=1))
-            payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
-            if self.offset is not None:
-                payload["offset"] = self.offset
-            try:
-                updates = await self.call("getUpdates", payload)
-                for update in updates:
-                    self.offset = update["update_id"] + 1
-                    await self.handle_update_safely(update)
-            except httpx.TimeoutException as exc:
-                # Long polling sits on a slow request by design; a read timeout is
-                # a transient blip, not an incident worth paging the admin about.
-                log.info("getUpdates %s, retrying long poll", type(exc).__name__)
-                await asyncio.sleep(1)
-            except (httpx.HTTPError, RuntimeError) as exc:
-                await self.report_error("ошибка Telegram API", exc, notify_admin=False)
-                await asyncio.sleep(5)
+        self.watchdog = getattr(self, "watchdog", None) or SystemdWatchdog()
+        await self.watchdog.start()
+        dispatcher = self.create_dispatcher()
+        scheduler = asyncio.create_task(self._run_scheduler(), name="scan-scheduler")
+        try:
+            await dispatcher.start_polling(
+                self.bot,
+                polling_timeout=25,
+                allowed_updates=["message", "callback_query"],
+                handle_as_tasks=False,
+                handle_signals=False,
+                close_bot_session=False,
+            )
+        finally:
+            scheduler.cancel()
+            await asyncio.gather(scheduler, return_exceptions=True)
+            await self.watchdog.stop()
+            scan_task = getattr(self, "scan_task", None)
+            if scan_task is not None and not scan_task.done():
+                self.scan_cancel_event.set()
+                scan_task.cancel()
+                await asyncio.gather(scan_task, return_exceptions=True)
 
 
 async def main() -> None:

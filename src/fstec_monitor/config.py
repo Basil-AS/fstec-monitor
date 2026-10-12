@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,8 +19,35 @@ class Settings(BaseSettings):
     max_retries: int = 3
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
-    telegram_admin_id: int = 151599744
-    telegram_api_root: str = "http://127.0.0.1:8081"
+    telegram_admin_id: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices(
+            "TELEGRAM_ADMIN_ID",
+            "TELEGRAM_ADMIN_CHAT_ID",
+            "ADMIN_CHAT_ID",
+            "ADMIN_ID",
+            "ADMIN_USER_ID",
+            "SUPER_ADMIN_ID",
+            "FSTEC_TELEGRAM_ADMIN_ID",
+        ),
+    )
+    telegram_api_root: str = Field(
+        default="http://127.0.0.1:18081",
+        validation_alias=AliasChoices(
+            "TELEGRAM_API_ROOT",
+            "TELEGRAM_API_BASE",
+            "TELEGRAM_BOT_API_URL",
+            "FSTEC_TELEGRAM_API_ROOT",
+        ),
+    )
+    telegram_rich_messages_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TELEGRAM_RICH_MESSAGES_ENABLED",
+            "FSTEC_TELEGRAM_RICH_MESSAGES_ENABLED",
+        ),
+    )
     scan_interval_seconds: int = 86400
     tls_verify: bool = True
     storage_quota_bytes: int = 5 * 1024 * 1024 * 1024

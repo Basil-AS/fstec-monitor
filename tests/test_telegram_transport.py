@@ -68,19 +68,13 @@ def test_persistent_document_telemetry_records_returned_message_id(monkeypatch, 
         assert method == "sendChatAction"
         return True
 
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"ok": True, "result": {"message_id": 99}}
-
-    class Client:
-        async def post(self, *_args, **_kwargs):
-            return Response()
+    class API:
+        async def send_document(self, chat_id, name, data, caption):
+            assert (chat_id, name, data, caption) == (7, "report.md", b"# report", "")
+            return type("Message", (), {"message_id": 99})()
 
     bot.call = call
-    bot.client = Client()
+    bot.api = API()
     monkeypatch.setenv("FSTEC_TGUX_LOGGING", "1")
 
     with caplog.at_level("INFO"):
@@ -90,35 +84,28 @@ def test_persistent_document_telemetry_records_returned_message_id(monkeypatch, 
     assert "TGUX chat=7 method=sendDocument message_id=99 screen=- reason=persistent-report" in caplog.text
 
 
-def test_send_file_uses_bounded_upload_timeout_and_closes_response() -> None:
+def test_send_file_uses_shared_aiogram_api_for_document_upload() -> None:
     bot = TelegramBot.__new__(TelegramBot)
-    bot.token = "token"
-    requests = []
+    calls = []
 
     async def call(method, payload):
         assert method == "sendChatAction"
+        calls.append((method, payload))
         return True
 
-    class Response:
-        async def aclose(self):
-            requests.append("closed")
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"ok": True, "result": {"message_id": 100}}
-
-    class Client:
-        async def post(self, *args, **kwargs):
-            requests.append(kwargs["timeout"])
-            return Response()
+    class API:
+        async def send_document(self, chat_id, name, data, caption):
+            calls.append(("send_document", chat_id, name, data, caption))
+            return type("Message", (), {"message_id": 100})()
 
     bot.call = call
-    bot.client = Client()
+    bot.api = API()
 
-    assert asyncio.run(bot.send_file(7, "report.md", b"# report")) == 100
-    assert requests == [120.0, "closed"]
+    assert asyncio.run(bot.send_file(7, "report.md", b"# report", "Report")) == 100
+    assert calls == [
+        ("sendChatAction", {"chat_id": 7, "action": "upload_document"}),
+        ("send_document", 7, "report.md", b"# report", "Report"),
+    ]
 
 
 def test_markup_cleanup_has_a_dedicated_bot_api_method() -> None:

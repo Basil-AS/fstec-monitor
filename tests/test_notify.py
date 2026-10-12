@@ -1,8 +1,6 @@
 import asyncio
 from typing import ClassVar
 
-import httpx
-import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -35,6 +33,14 @@ class _TelegramClient:
     async def __aexit__(self, *_args):
         return False
 
+    async def call(self, method, payload):
+        self.calls.append((method, payload))
+        return {"message_id": len(self.calls)}
+
+    async def call_rich(self, method, payload, _fallback_payload, *, fallback_method=None):
+        self.calls.append((method, payload))
+        return {"message_id": len(self.calls)}
+
     async def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return _TelegramResponse()
@@ -58,7 +64,7 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -71,23 +77,16 @@ def test_notify_pending_sends_one_change_digest_and_one_error_digest(monkeypatch
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
 
-def test_notification_timeout_is_not_retried_after_unknown_telegram_outcome(monkeypatch):
+def test_notification_timeout_is_not_retried_after_unknown_telegram_outcome():
     calls = 0
 
     class Client:
-        async def post(self, *_args, **_kwargs):
+        async def call_rich(self, *_args, **_kwargs):
             nonlocal calls
             calls += 1
-            raise httpx.ReadTimeout("Telegram response timed out")
+            raise RuntimeError("Telegram API transport failed (TelegramNetworkError)")
 
-    async def fail_sleep(_delay):
-        raise AssertionError("an unknown sendMessage outcome must not be retried")
-
-    monkeypatch.setattr(notify_module.asyncio, "sleep", fail_sleep)
-
-    with pytest.raises(httpx.ReadTimeout):
-        asyncio.run(notify_module._post_notification(Client(), "https://example.test", {"text": "x"}))
-
+    assert asyncio.run(notify_module._send_digest(Client(), 123, "digest")) is False
     assert calls == 1
 
 
@@ -99,14 +98,14 @@ def test_notify_pending_does_not_retry_unknown_telegram_transport_outcome(monkey
     class RetryingClient(_TelegramClient):
         attempts = 0
 
-        async def post(self, url, **kwargs):
+        async def call_rich(self, method, payload, fallback, *, fallback_method=None):
             self.attempts += 1
             if self.attempts == 1:
-                raise httpx.ReadTimeout("temporary Telegram timeout")
-            return await super().post(url, **kwargs)
+                raise RuntimeError("Telegram API transport failed (TelegramNetworkError)")
+            return await super().call_rich(method, payload, fallback, fallback_method=fallback_method)
 
     client = RetryingClient()
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: client)
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -118,32 +117,25 @@ def test_notify_pending_does_not_retry_unknown_telegram_transport_outcome(monkey
     assert session.scalar(select(Event).where(Event.notified.is_(False))) is not None
 
 
-def test_post_notification_retries_explicit_retryable_http_status(monkeypatch):
+def test_notification_retries_only_typed_rate_limit(monkeypatch):
     calls = 0
 
-    class Response:
-        def __init__(self, status_code):
-            self.status_code = status_code
-            self.request = httpx.Request("POST", "https://example.test")
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise httpx.HTTPStatusError("retryable", request=self.request, response=self)
-
-        def json(self):
-            return {"ok": True}
+    class RateLimit(Exception):
+        retry_after = 1
 
     class Client:
-        async def post(self, *_args, **_kwargs):
+        async def call_rich(self, *_args, **_kwargs):
             nonlocal calls
             calls += 1
-            return Response(503 if calls == 1 else 200)
+            if calls == 1:
+                raise RateLimit()
 
     async def no_sleep(_delay):
         return None
 
+    monkeypatch.setattr(notify_module, "TelegramRetryAfter", RateLimit)
     monkeypatch.setattr(notify_module.asyncio, "sleep", no_sleep)
-    asyncio.run(notify_module._post_notification(Client(), "https://example.test", {"text": "x"}))
+    assert asyncio.run(notify_module._send_digest(Client(), 123, "digest")) is True
     assert calls == 2
 
 
@@ -193,7 +185,7 @@ def test_notify_pending_splits_oversized_digest(monkeypatch, tmp_path):
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -201,7 +193,7 @@ def test_notify_pending_splits_oversized_digest(monkeypatch, tmp_path):
     sent = asyncio.run(notify_module.notify_pending(session))
 
     assert sent == len(_TelegramClient.calls) > 1
-    assert all(len(call[1]["json"]["text"]) <= 4096 for call in _TelegramClient.calls)
+    assert all(len(call[1]["rich_message"]["html"]) <= 4096 for call in _TelegramClient.calls)
     assert len(session.scalars(select(EventDelivery)).all()) == 30
     assert all(event.notified for event in session.scalars(select(Event)).all())
 
@@ -226,14 +218,14 @@ def test_partial_digest_delivery_records_successful_parts(monkeypatch, tmp_path)
     class PartialFailureClient(_TelegramClient):
         attempts = 0
 
-        async def post(self, url, **kwargs):
+        async def call_rich(self, method, payload, fallback, *, fallback_method=None):
             self.attempts += 1
             if self.attempts == 2:
-                raise httpx.ReadTimeout("Telegram timed out after accepting an earlier chunk")
-            return await super().post(url, **kwargs)
+                raise RuntimeError("Telegram API transport failed after an earlier chunk")
+            return await super().call_rich(method, payload, fallback, fallback_method=fallback_method)
 
     client = PartialFailureClient()
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: client)
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -250,7 +242,7 @@ def test_notify_pending_silences_an_already_delivered_error(monkeypatch, tmp_pat
     session.add(Event(kind="fetch_error", severity="warning", summary="Сайт недоступен", notified=False))
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
 
@@ -267,13 +259,13 @@ def test_notify_pending_delivers_event_to_each_approved_chat(monkeypatch, tmp_pa
     session.add(document)
     session.flush()
     session.add_all([
-        UserAccess(user_id=10, chat_id=200, status="approved"),
-        UserAccess(user_id=11, chat_id=201, status="approved"),
+        UserAccess(user_id=200, chat_id=200, status="approved"),
+        UserAccess(user_id=201, chat_id=201, status="approved"),
         Event(document_id=document.id, kind="document_added", severity="warning", summary="Новый документ"),
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -295,11 +287,11 @@ def test_notify_pending_serializes_concurrent_delivery_passes(monkeypatch, tmp_p
     _TelegramClient.calls = []
 
     class SlowTelegramClient(_TelegramClient):
-        async def post(self, url, **kwargs):
+        async def call_rich(self, method, payload, fallback, *, fallback_method=None):
             await asyncio.sleep(0.05)
-            return await super().post(url, **kwargs)
+            return await super().call_rich(method, payload, fallback, fallback_method=fallback_method)
 
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: SlowTelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: SlowTelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -324,9 +316,9 @@ def test_notify_pending_applies_personal_category_ignore(monkeypatch, tmp_path):
     session.add_all([kept, hidden])
     session.flush()
     session.add_all([
-        UserAccess(user_id=10, chat_id=200, status="approved"),
+        UserAccess(user_id=200, chat_id=200, status="approved"),
         UserIgnoredCategory(
-            user_id=10,
+            user_id=200,
             category_key="методические документы",
             category_name="Методические документы",
         ),
@@ -335,7 +327,7 @@ def test_notify_pending_applies_personal_category_ignore(monkeypatch, tmp_path):
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "123")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -343,7 +335,7 @@ def test_notify_pending_applies_personal_category_ignore(monkeypatch, tmp_path):
     sent = asyncio.run(notify_module.notify_pending(session))
 
     assert sent == 2
-    messages_by_chat = {call[1]["json"]["chat_id"]: call[1]["json"]["text"] for call in _TelegramClient.calls}
+    messages_by_chat = {call[1]["chat_id"]: call[1]["rich_message"]["html"] for call in _TelegramClient.calls}
     assert "Оставить" in messages_by_chat[123]
     assert "Скрыть" in messages_by_chat[123]
     assert "Оставить" in messages_by_chat[200]
@@ -367,7 +359,7 @@ def test_notify_pending_applies_global_ignore_to_admin(monkeypatch, tmp_path):
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 123)
@@ -400,7 +392,7 @@ def test_admin_notification_applies_personal_category_filter(monkeypatch, tmp_pa
     ])
     session.commit()
     _TelegramClient.calls = []
-    monkeypatch.setattr(notify_module.httpx, "AsyncClient", lambda **_kwargs: _TelegramClient())
+    monkeypatch.setattr(notify_module, "get_telegram_api", lambda *_args, **_kwargs: _TelegramClient())
     monkeypatch.setattr(notify_module.settings, "telegram_bot_token", "token")
     monkeypatch.setattr(notify_module.settings, "telegram_chat_id", "")
     monkeypatch.setattr(notify_module.settings, "telegram_admin_id", 151599744)

@@ -20,6 +20,7 @@ from fstec_monitor.crawler import (
 )
 from fstec_monitor.models import (
     Attachment,
+    AttachmentVersion,
     Base,
     Document,
     Event,
@@ -251,6 +252,156 @@ def test_attachment_extraction_runs_off_event_loop(monkeypatch, tmp_path):
     assert extraction_threads[0] is not main_thread
 
 
+def test_changed_attachment_variants_emit_one_preferred_semantic_event(monkeypatch, tmp_path):
+    import hashlib
+
+    engine = create_engine(f"sqlite:///{tmp_path}/preferred-attachment-events.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    monkeypatch.setattr(crawler, "semantic_text", lambda *_args: "new semantic wording")
+
+    class Store:
+        def __init__(self):
+            self.objects = {"old-pdf-text": b"old semantic wording", "old-odt-text": b"old semantic wording"}
+
+        def put(self, data, suffix):
+            key = f"object-{len(self.objects)}{suffix}"
+            self.objects[key] = data
+            return hashlib.sha256(data).hexdigest(), key
+
+        def read(self, key):
+            return self.objects[key]
+
+    class Fetcher:
+        async def get(self, url, **_kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                content=url.rsplit(".", 1)[-1].encode(),
+                headers={"content-type": "application/octet-stream"},
+                raise_for_status=lambda: None,
+            )
+
+    async def run():
+        monitor = Monitor.__new__(Monitor)
+        monitor.store = Store()
+        monitor.fetcher = Fetcher()
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/doc", title="Report")
+            session.add(document)
+            session.flush()
+            for ext, old_text_key in (("pdf", "old-pdf-text"), ("odt", "old-odt-text")):
+                attachment = Attachment(
+                    document_id=document.id,
+                    url=f"https://example.test/doc.{ext}",
+                    display_name=f"doc.{ext}",
+                )
+                session.add(attachment)
+                session.flush()
+                session.add(AttachmentVersion(
+                    attachment_id=attachment.id,
+                    status_code=200,
+                    content_type="application/octet-stream",
+                    content_length=3,
+                    binary_sha256=f"old-{ext}-hash",
+                    semantic_sha256=hashlib.sha256(b"old semantic wording").hexdigest(),
+                    object_key=f"old-{ext}-binary",
+                    extracted_text_key=old_text_key,
+                ))
+            session.commit()
+            links = [
+                SimpleNamespace(url="https://example.test/doc.pdf", title="Report.pdf"),
+                SimpleNamespace(url="https://example.test/doc.odt", title="Report.odt"),
+            ]
+            await monitor._sync_attachments(
+                session, document, links, None, "", False, False, True, datetime.now(UTC)
+            )
+            session.commit()
+            event_kinds = session.scalars(select(Event.kind).order_by(Event.id)).all()
+            version_count = session.scalar(select(func.count(AttachmentVersion.id)))
+            return event_kinds, version_count
+
+    event_kinds, version_count = asyncio.run(run())
+    assert event_kinds.count("attachment_content_changed") == 1
+    assert event_kinds.count("attachment_binary_changed") == 2
+    assert version_count == 4
+
+
+def test_new_document_attachment_does_not_duplicate_document_added_with_review_event(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/new-document-attachment-events.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    monkeypatch.setattr(crawler, "semantic_text", lambda *_args: "")
+
+    class Store:
+        def put(self, data, suffix):
+            return "binary-hash", f"object{suffix}"
+
+    class Fetcher:
+        async def get(self, _url, **_kwargs):
+            return SimpleNamespace(
+                status_code=200, content=b"opaque", headers={}, raise_for_status=lambda: None,
+            )
+
+    async def run():
+        monitor = Monitor.__new__(Monitor)
+        monitor.store = Store()
+        monitor.fetcher = Fetcher()
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/new", title="New")
+            session.add(document)
+            session.flush()
+            session.add(Event(document_id=document.id, kind="document_added", severity="warning", summary="new doc"))
+            session.commit()
+            links = [SimpleNamespace(url="https://example.test/new.pdf", title="New.pdf")]
+            await monitor._sync_attachments(
+                session, document, links, None, "", False, True, True, datetime.now(UTC)
+            )
+            session.commit()
+            return session.scalars(select(Event.kind).order_by(Event.id)).all()
+
+    assert asyncio.run(run()) == ["document_added"]
+
+
+def test_new_attachment_has_added_event_without_review_until_content_exists(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/first-attachment-version.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+    monkeypatch.setattr(crawler, "semantic_text", lambda *_args: "")
+
+    class Store:
+        def put(self, data, suffix):
+            return "binary-hash", f"object{suffix}"
+
+    class Fetcher:
+        async def get(self, _url, **_kwargs):
+            return SimpleNamespace(
+                status_code=200, content=b"opaque", headers={}, raise_for_status=lambda: None,
+            )
+
+    async def run():
+        monitor = Monitor.__new__(Monitor)
+        monitor.store = Store()
+        monitor.fetcher = Fetcher()
+        with session_factory() as session:
+            document = Document(canonical_url="https://example.test/existing", title="Existing")
+            session.add(document)
+            session.commit()
+            links = [SimpleNamespace(url="https://example.test/existing.pdf", title="Existing.pdf")]
+            await monitor._sync_attachments(
+                session, document, links, None, "", False, False, True, datetime.now(UTC)
+            )
+            session.commit()
+            return session.scalars(select(Event.kind).order_by(Event.id)).all()
+
+    assert asyncio.run(run()) == ["attachment_added"]
+
+
 def test_attachment_fetch_has_one_overall_timeout(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/attachment-timeout.db")
     Base.metadata.create_all(engine)
@@ -460,7 +611,7 @@ def test_changed_document_creates_new_snapshot(monkeypatch, tmp_path):
         assert session.scalar(select(func.count(Snapshot.id))) == 2
 
 
-def test_markup_only_change_archives_latest_html_and_reports_markup_event(monkeypatch, tmp_path):
+def test_markup_only_change_archives_latest_html_without_change_event(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path}/crawler.db")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -479,10 +630,61 @@ def test_markup_only_change_archives_latest_html_and_reports_markup_event(monkey
     asyncio.run(run())
     with session_factory() as session:
         assert session.scalar(select(func.count(Snapshot.id))) == 2
-        event = session.scalar(select(Event).where(Event.kind == "html_markup_changed"))
-        assert event is not None
+        assert session.scalar(select(Event).where(Event.kind == "html_markup_changed")) is None
         assert session.scalar(select(Event).where(Event.kind == "html_content_changed")) is None
-        assert "<strong>" in event.details
+        latest = session.scalar(select(Snapshot).order_by(Snapshot.id.desc()))
+        assert latest is not None
+        assert b"<strong>" in (tmp_path / "objects" / latest.raw_object).read_bytes()
+
+
+def test_page_counter_noise_archives_raw_snapshot_without_event_and_updates_validators(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path}/counter-noise.db")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(crawler, "SessionLocal", session_factory)
+    monkeypatch.setattr(crawler.settings, "storage_dir", tmp_path / "objects")
+
+    def html(counter):
+        return (
+            f"<html><body><div class='pagination'>{counter}</div>"
+            "<main><article><h1>Doc</h1><p>Content line</p></article></main></body></html>"
+        )
+
+    class CounterFetcher:
+        def __init__(self, counter, etag):
+            self.counter = counter
+            self.etag = etag
+
+        async def get(self, url, headers=None, **_kwargs):
+            content = html(self.counter)
+            return SimpleNamespace(
+                status_code=200,
+                text=content,
+                content=content.encode(),
+                url=url,
+                headers={"etag": self.etag, "last-modified": f"updated-{self.counter}"},
+                raise_for_status=lambda: None,
+            )
+
+    async def run():
+        monitor = Monitor()
+        url = "https://fstec.ru/dokumenty/vse-dokumenty/cat/doc"
+        monitor.fetcher = CounterFetcher(670, '"page-670"')
+        await monitor.process_document(url, baseline=True)
+        monitor.fetcher = CounterFetcher(671, '"page-671"')
+        await monitor.process_document(url)
+
+    asyncio.run(run())
+    with session_factory() as session:
+        snapshots = session.scalars(select(Snapshot).order_by(Snapshot.id)).all()
+        document = session.scalar(select(Document))
+        assert len(snapshots) == 2
+        assert snapshots[0].raw_sha256 != snapshots[1].raw_sha256
+        assert b"671" in (tmp_path / "objects" / snapshots[-1].raw_object).read_bytes()
+        assert snapshots[-1].etag == '"page-671"'
+        assert document.current_etag == '"page-671"'
+        assert document.current_last_modified == "updated-671"
+        assert session.scalars(select(Event)).all() == []
 
 
 def test_reconcile_documents_confirms_removal_and_does_not_repeat_event(tmp_path):
